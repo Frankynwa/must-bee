@@ -57,6 +57,13 @@ pending [--course CODE]
 files [--course CODE] [--date DATE]    # --course --date: files between previous class and DATE
 files --recent [--n N]                 # N most recently synced (by local sync time, not upload date; default N=10)
 
+# Obsidian review notes
+notes                                  # generate review notes for downloaded PDF/PPTX without a note yet
+notes --course CODE                    # only that course
+notes --dry-run                        # list what would be generated (no LLM calls)
+notes --force                          # regenerate existing notes
+notes --limit N                        # at most N files
+
 # State
 status
 
@@ -86,6 +93,7 @@ status
 - **Downloads are limited to PDF / PPT / PPTX**; other extensions are skipped by design.
 - **Download layout:** `mod/folder` resources are downloaded recursively (folder structure preserved); `mod/assign` resources get a named subfolder with intro attachments; other modules are top-level files.
 - **Announcements (mod/forum) are scanned too:** recent discussion posts are opened and (a) Moodle pluginfile attachments and (b) external links (Dropbox / Google Drive / OneDrive / MEGA / WeTransfer — plain-text URLs included) are collected and downloaded. Dropbox share links are auto-converted `dl=0` → `dl=1`; folder shares (zip) are auto-extracted for PDF/PPT/PPTX.
+- **Obsidian review notes (`notes`):** generated per courseware file into the vault's `Courses/<course> <code>/<date> <file>.md` with frontmatter `type: courseware-note`, `tags: [courseware, <code>]`. Q&A lines use `Q :: A` and cloze `==answer==` — both plain-text readable and compatible with the obsidian-spaced-repetition plugin if installed. Vault resolution: `OBSIDIAN_VAULT_PATH` env is corrected to `~/Vaults/Obsidian` when it points at the old iCloud vault. Requires python3 with PyMuPDF + python-pptx + requests and `DEEPSEEK_API_KEY` (read from `~/.hermes/.env`). Review dashboards live in `Courses/复习面板.md` (dataview).
 - **DNS caveat:** some campus networks stall the OS resolver (mDNSResponder) on CDN domains like dropbox.com (`curl` reports "Resolving timed out" while `nslookup` works). must-bee downloads external links via direct DNS queries (Node `dns.Resolver`), so this is handled. For manual downloads use `curl --resolve host:443:<ip-from-nslookup>`.
 - Files live under `$MUSTER_DOWNLOAD_PATH/wemust/<course-folder>/`.
 
@@ -100,6 +108,7 @@ All commands print one JSON value to stdout. Key shapes for parsing:
 | `courses` | `{ source: 'cache' \| 'fresh-sync', termCode, total, courses[] }` — course: `{ courseCode, courseName, moodleUrl, files, lastSynced }` |
 | `course` | `{ courseCode, courseName, moodleUrl, assignments[], quizzes[], materials[], announcements[] }` — material/announcement entries: `{ name, url, updated }` / `{ forumUrl, forumName, posts[] }` (post: `{ title, url, date, attachments }`) |
 | `pending` | `{ total, events[] }` — event: `{ name, dueDate, course, courseUrl, eventType, url }` |
+| `notes` | `{ vault, generated[], errors[] }` — generated: `{ course, courseCode, file, note, chars }` (dry-run: `{ vault, tasks[] }`) |
 | `files` (bare or `--course`) | array of `{ courseCode, courseName, moodleUrl, filename, uploadDate, path }`, sorted by `uploadDate` ascending |
 | `files --course --date` | `{ fromCache, prevDate, files[] }` — file: `{ filename, uploadDate, path }` |
 | `files --recent` | array of `{ courseCode, courseName, filename, uploadDate, firstSeen, path }`, sorted by `firstSeen` descending |

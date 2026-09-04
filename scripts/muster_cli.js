@@ -1815,6 +1815,52 @@ async function cmdCourse(options) {
   }
 }
 
+// ── Command: notes ─────────────────────────────────────────────────────────────
+//
+// notes                        → generate Obsidian review notes for every
+//                                downloaded courseware file that has no note yet
+// notes --course CS440         → only that course
+// notes --dry-run              → list what would be generated (no LLM calls)
+// notes --force                → regenerate notes that already exist
+// notes --limit N              → at most N files
+//
+// Delegates to scripts/notes.py (Python: PyMuPDF / python-pptx / DeepSeek).
+// Returns the notes.py JSON: { vault, generated[], errors[] }.
+
+async function cmdNotes(options) {
+  const { spawn } = require('child_process');
+  const args = ['scripts/notes.py'];
+  if (options.course) args.push('--course', String(options.course));
+  if ('dry-run' in options) args.push('--dry-run');
+  if ('force' in options) args.push('--force');
+  if (options.limit) args.push('--limit', String(options.limit));
+
+  return new Promise((resolve, reject) => {
+    const child = spawn('python3', args, {
+      cwd: path.join(__dirname, '..'),
+      env: process.env,
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (d) => { stdout += d; });
+    child.stderr.on('data', (d) => { stderr += d; });
+    child.on('error', (err) => reject(err));
+    child.on('close', (code) => {
+      try {
+        const parsed = JSON.parse(stdout);
+        if (code !== 0 && parsed.error) {
+          reject(new Error(parsed.error));
+          return;
+        }
+        resolve(parsed);
+      } catch (e) {
+        reject(new Error(stderr.trim() || stdout.trim() || `notes exited with code ${code}`));
+      }
+    });
+  });
+}
+
 // ── Command: status ───────────────────────────────────────────────────────────
 //
 // status → overview of sync state
@@ -1889,6 +1935,7 @@ function printUsage() {
   node scripts/muster_cli.js course --code COURSECODE
   node scripts/muster_cli.js pending [--course COURSECODE]
   node scripts/muster_cli.js files [--course COURSECODE] [--date YYYY-MM-DD] [--recent [--n N]]
+  node scripts/muster_cli.js notes [--course COURSECODE] [--dry-run] [--force] [--limit N]
   node scripts/muster_cli.js status
 
 Examples:
@@ -1912,6 +1959,8 @@ Notes:
   - Announcements (mod/forum) are scanned: pluginfile attachments and external
     links (Dropbox / Google Drive / OneDrive / MEGA / WeTransfer) are downloaded;
     Dropbox folder shares are fetched as zip and PDF/PPT/PPTX inside are extracted
+  - notes generates Obsidian review notes (lecture summary + Q&A flashcards +
+    cloze) from downloaded PDF/PPTX into the Obsidian vault's Courses/ folder
   - Only PDF/PPT/PPTX are downloaded`);
 }
 
@@ -1931,6 +1980,7 @@ async function main() {
   else if (cmd === 'files')    result = await cmdFiles(options);
   else if (cmd === 'courses')  result = await cmdCourses(options);
   else if (cmd === 'course')   result = await cmdCourse(options);
+  else if (cmd === 'notes')    result = await cmdNotes(options);
   else if (cmd === 'status')   result = await cmdStatus();
   else throw new Error(`Unknown command '${cmd}'. Run with --help for usage.`);
 
