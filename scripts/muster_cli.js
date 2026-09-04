@@ -6,6 +6,10 @@ const fs = require('fs');
 const fsp = fs.promises;
 const os = require('os');
 const path = require('path');
+const http = require('http');
+const https = require('https');
+const dns = require('dns');
+const AdmZip = require('adm-zip');
 const { chromium } = require('playwright');
 
 let DEBUG = false;
@@ -827,6 +831,272 @@ async function collectFilesFromAssign(page, context, assignUrl, creds, subDir, o
   return out;
 }
 
+// ── Announcements (forum) + external link (Dropbox etc.) collectors ─────────
+
+const EXTERNAL_LINK_HOST_RE = /(dropbox\.com|drive\.google\.com|onedrive\.live\.com|1drv\.ms|mega\.nz|we\.tl)$/i;
+
+function dropboxDirectUrl(url) {
+  try {
+    const u = new URL(url);
+    if (u.hostname === 'www.dropbox.com' || u.hostname === 'dropbox.com') {
+      if (u.searchParams.get('dl') === '0' || !u.searchParams.has('dl')) {
+        u.searchParams.set('dl', '1');
+      }
+    }
+    return u.toString();
+  } catch {
+    return url;
+  }
+}
+
+// DNS resolver that bypasses the OS resolver (mDNSResponder can stall on some
+// CDN names like dropbox.com on campus networks). Uses direct DNS queries and
+// supports Node's happy-eyeballs lookup (opts.all → return address array).
+function resolve4WithTimeout(hostname, ms = 8000) {
+  return new Promise((resolve, reject) => {
+    const r = new dns.Resolver();
+    const timer = setTimeout(() => {
+      r.cancel();
+      reject(new Error(`DNS timeout for ${hostname}`));
+    }, ms);
+    r.resolve4(hostname, (err, addrs) => {
+      clearTimeout(timer);
+      if (err) reject(err);
+      else resolve(addrs);
+    });
+  });
+}
+
+function dnsResolver() {
+  const cache = new Map();
+  return (hostname, opts, cb) => {
+    const wantAll = !!(opts && opts.all);
+    const done = (err, addrs) => {
+      if (err) { cb(err); return; }
+      if (wantAll) cb(null, addrs);
+      else if (addrs && addrs.length) cb(null, addrs[0].address, addrs[0].family);
+      else cb(new Error(`no address for ${hostname}`));
+    };
+    if (cache.has(hostname)) {
+      process.nextTick(() => done(null, cache.get(hostname)));
+      return;
+    }
+    resolve4WithTimeout(hostname).then((ips) => {
+      const addrs = ips.map((ip) => ({ address: ip, family: 4 }));
+      cache.set(hostname, addrs);
+      done(null, addrs);
+    }).catch((err) => {
+      const e = new Error(`DNS resolve failed for ${hostname}: ${err && (err.code || err.message)}`);
+      e.code = err && err.code;
+      cb(e);
+    });
+  };
+}
+
+function httpGetExternal(url, redirectsLeft = 5) {
+  return new Promise((resolve, reject) => {
+    let target;
+    try {
+      target = new URL(url);
+    } catch (e) {
+      reject(e);
+      return;
+    }
+    const lib = target.protocol === 'https:' ? https : http;
+    const req = lib.get(target, {
+      lookup: dnsResolver(),
+      headers: { 'User-Agent': 'must-bee/1.0 (courseware sync)' }
+    }, (res) => {
+      const status = res.statusCode || 0;
+      if (status >= 300 && status < 400 && res.headers.location && redirectsLeft > 0) {
+        res.resume();
+        const next = new URL(res.headers.location, target).toString();
+        resolve(httpGetExternal(next, redirectsLeft - 1));
+        return;
+      }
+      if (status !== 200) {
+        res.resume();
+        reject(new Error(`HTTP ${status} for ${target.hostname}${target.pathname}`));
+        return;
+      }
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve({ url: target.toString(), buffer: Buffer.concat(chunks), headers: res.headers }));
+    });
+    req.on('error', reject);
+    req.setTimeout(120000, () => req.destroy(new Error('download timeout')));
+  });
+}
+
+function isZipBuffer(buffer) {
+  return buffer.length > 4 && buffer[0] === 0x50 && buffer[1] === 0x4b;
+}
+
+function extractZipFiles(buffer) {
+  // Extract PDF/PPT/PPTX entries from a zip archive (e.g. a shared Dropbox
+  // folder downloaded as zip). Returns { isZip, files: [{filename, buffer}] }.
+  if (!isZipBuffer(buffer)) return { isZip: false, files: [] };
+  const out = [];
+  try {
+    const zip = new AdmZip(buffer);
+    for (const entry of zip.getEntries()) {
+      if (entry.isDirectory) continue;
+      const name = safeFilename(path.basename(entry.entryName));
+      if (!FILE_EXT_RE.test(name)) continue;
+      out.push({ filename: name, buffer: entry.getData() });
+    }
+    return { isZip: true, files: out };
+  } catch {
+    return { isZip: true, files: [] };
+  }
+}
+
+async function listForumLinks(page, courseUrl, creds) {
+  await gotoAndAuth(page, courseUrl, creds);
+  const rawLinks = await page.evaluate(() =>
+    Array.from(document.querySelectorAll('a[href*="/mod/forum/view.php"]'))
+      .map(a => ({ href: a.getAttribute('href'), text: a.textContent || '' }))
+      .filter(x => x.href)
+  );
+  const seen = new Set();
+  const out = [];
+  for (const { href, text } of rawLinks) {
+    const url = new URL(href, MOODLE_URL).toString();
+    if (seen.has(url)) continue;
+    seen.add(url);
+    out.push({ url, name: normalizeText(text) || 'Announcements' });
+  }
+  return out;
+}
+
+async function collectForumAttachments(page, context, forumUrl, creds, options = {}) {
+  // Scans a forum (Announcements) page: opens recent discussion posts and
+  // collects (a) Moodle pluginfile attachments and (b) external file links
+  // (Dropbox/Drive/...). Returns { forumUrl, posts, candidates }.
+  const maxPosts = options.maxPosts || 10;
+  await gotoAndAuth(page, forumUrl, creds);
+
+  const postLinks = await page.evaluate(() => {
+    const seen = new Set();
+    const out = [];
+    for (const a of document.querySelectorAll('a[href*="/mod/forum/discuss.php"]')) {
+      const href = a.getAttribute('href');
+      if (!href) continue;
+      try {
+        const u = new URL(href, location.href);
+        u.searchParams.delete('parent');
+        const key = u.toString();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push({ url: key, title: (a.textContent || '').trim() });
+      } catch { /* skip malformed */ }
+    }
+    return out;
+  });
+
+  const posts = [];
+  const candidates = [];
+  for (const post of postLinks.slice(0, maxPosts)) {
+    await gotoAndAuth(page, post.url, creds);
+    const postInfo = await page.evaluate(() => {
+      const contentEl = document.querySelector('.post-content-container, .no-overflow, [data-region="post-content"]') || document.body;
+      const pluginfiles = Array.from(contentEl.querySelectorAll('a[href*="pluginfile.php"]'))
+        .map(a => a.getAttribute('href')).filter(Boolean);
+      const hostRe = /(dropbox\.com|drive\.google\.com|onedrive\.live\.com|1drv\.ms|mega\.nz|we\.tl)$/i;
+      const externals = [];
+      const seen = new Set();
+      const pushExt = (href) => {
+        if (!href) return;
+        try {
+          const host = new URL(href).hostname;
+          if (!hostRe.test(host)) return;
+          if (seen.has(href)) return;
+          seen.add(href);
+          externals.push(href);
+        } catch { /* skip */ }
+      };
+      // 1) hyperlinks in the post body
+      for (const a of contentEl.querySelectorAll('a')) pushExt(a.getAttribute('href'));
+      // 2) plain-text URLs (Moodle does not auto-linkify post bodies)
+      const text = contentEl.innerText || '';
+      for (const m of text.match(/https?:\/\/[^\s"'<>]+/g) || []) {
+        pushExt(m.replace(/[),.;，。；、]+$/, ''));
+      }
+      let dateStr = null;
+      const timeEl = contentEl.querySelector('time') || document.querySelector('.forumpost time');
+      const raw = timeEl && (timeEl.getAttribute('datetime') || timeEl.getAttribute('data-timestamp'));
+      if (raw) {
+        const d = /^\d+$/.test(raw) ? new Date(Number(raw) * 1000) : new Date(raw);
+        if (!isNaN(d.getTime())) dateStr = d.toISOString().slice(0, 10);
+      }
+      return { pluginfiles, external: externals, dateStr };
+    });
+
+    const uploadDate = postInfo.dateStr || macauDateOffset(0);
+    posts.push({
+      title: post.title || '(untitled)',
+      url: post.url,
+      date: uploadDate,
+      attachments: postInfo.pluginfiles.length + postInfo.external.length
+    });
+
+    for (const href of postInfo.pluginfiles) {
+      const fileUrl = new URL(href, MOODLE_URL).toString();
+      const meta = await probeFileMetadata(context, fileUrl, null);
+      if (!FILE_EXT_RE.test(meta.filename)) continue;
+      candidates.push({ resourceUrl: forumUrl, fileUrl: meta.fileUrl, normalizedFileUrl: meta.normalizedFileUrl, filename: meta.filename, size: meta.size, uploadDate });
+    }
+
+    if (options.skipExternalDownload) continue;
+    for (const href of postInfo.external) {
+      const direct = dropboxDirectUrl(href);
+      try {
+        const resp = await httpGetExternal(direct);
+        const cd = String(resp.headers['content-disposition'] || '');
+        const utf = cd.match(/filename\*=UTF-8''([^;]+)/i);
+        const plain = cd.match(/filename="?([^";]+)"?/i);
+        let rawName = utf ? decodeURIComponent(utf[1]) : (plain ? plain[1] : '');
+        if (!rawName) {
+          try { rawName = path.basename(new URL(direct).pathname) || 'download.bin'; } catch { rawName = 'download.bin'; }
+        }
+        rawName = rawName.replace(/[?#].*$/, '');
+
+        if (/\.zip$/i.test(rawName) || isZipBuffer(resp.buffer)) {
+          const { files: inner } = extractZipFiles(resp.buffer);
+          if (inner.length > 0) {
+            for (const f of inner) {
+              candidates.push({
+                resourceUrl: forumUrl,
+                fileUrl: direct,
+                normalizedFileUrl: normalizeFileUrl(direct),
+                filename: f.filename,
+                size: f.buffer.length,
+                uploadDate,
+                _inlineBuffer: f.buffer
+              });
+            }
+            continue;
+          }
+        }
+        if (!FILE_EXT_RE.test(rawName) && !/\.zip$/i.test(rawName)) continue;
+        candidates.push({
+          resourceUrl: forumUrl,
+          fileUrl: direct,
+          normalizedFileUrl: normalizeFileUrl(direct),
+          filename: safeFilename(rawName),
+          size: resp.buffer.length,
+          uploadDate,
+          _inlineBuffer: resp.buffer
+        });
+      } catch (e) {
+        dbg(`external fetch failed ${href}: ${compactError(e)}`);
+      }
+    }
+  }
+
+  return { forumUrl, posts, candidates };
+}
+
 async function tryDownloadByUrl(page, fileUrl, outputDir) {
   const [download] = await Promise.all([
     page.waitForEvent('download', { timeout: 45000 }),
@@ -840,6 +1110,11 @@ async function tryDownloadByUrl(page, fileUrl, outputDir) {
 }
 
 async function downloadCandidate(page, candidate, outputDir, creds) {
+  if (candidate._inlineBuffer) {
+    const savePath = await ensureUniquePath(path.join(outputDir, safeFilename(candidate.filename)));
+    await fsp.writeFile(savePath, candidate._inlineBuffer);
+    return savePath;
+  }
   try {
     return await tryDownloadByUrl(page, candidate.fileUrl, outputDir);
   } catch {
@@ -944,6 +1219,39 @@ async function runSyncForCourse(course, page, context, creds, report, options = 
         report.counts.failed += 1;
         report.errors.push(`failed for ${c.fileUrl}: ${compactError(err)}`);
       }
+    }
+  }
+
+  // Announcements (forum) — posts may carry pluginfile attachments or
+  // external links (Dropbox / Drive / ...).
+  const forumLinks = await listForumLinks(page, course.url, creds);
+  for (const forum of forumLinks) {
+    try {
+      const forumResult = await withRetry(() =>
+        collectForumAttachments(page, context, forum.url, creds, options)
+      );
+      for (const c of forumResult.candidates) {
+        report.scannedCandidates += 1;
+        const candidate = { ...c, courseUrl: course.url };
+        try {
+          const result = await withRetry(() => classifyAndDownload(state, candidate, courseDir, page, creds));
+          report.counts[result.status] += 1;
+          if (result.savedPath) {
+            report.downloaded.push({
+              course: course.requestedName || course.name,
+              courseCode: course.courseCode || null,
+              filename: path.basename(result.savedPath),
+              filePath: result.savedPath,
+              status: result.status
+            });
+          }
+        } catch (err) {
+          report.counts.failed += 1;
+          report.errors.push(`failed for ${c.fileUrl}: ${compactError(err)}`);
+        }
+      }
+    } catch (scanErr) {
+      report.errors.push(`forum scan failed for ${forum.url}: ${compactError(scanErr)}`);
     }
   }
 
@@ -1472,13 +1780,33 @@ async function cmdCourse(options) {
       .map(enrich)
       .sort((a, b) => (b.updated || '').localeCompare(a.updated || ''));
 
+    // Announcements (forum) — lightweight scan of recent posts (no downloads)
+    const forumLinks = await listForumLinks(page, target.url, creds);
+    const announcements = [];
+    for (const forum of forumLinks) {
+      try {
+        const forumResult = await collectForumAttachments(page, context, forum.url, creds, {
+          skipExternalDownload: true,
+          maxPosts: 5
+        });
+        announcements.push({
+          forumUrl: forum.url,
+          forumName: forum.name,
+          posts: forumResult.posts
+        });
+      } catch (e) {
+        announcements.push({ forumUrl: forum.url, forumName: forum.name, error: compactError(e) });
+      }
+    }
+
     return {
       courseCode: target.courseCode,
       courseName: target.courseName,
       moodleUrl: target.url,
       assignments,
       quizzes,
-      materials
+      materials,
+      announcements
     };
   } finally {
     if (page) await page.close().catch(() => {});
@@ -1581,6 +1909,9 @@ Examples:
 Notes:
   - mod/folder resources are downloaded recursively, preserving folder structure
   - mod/assign resources create a named subfolder and download intro attachments
+  - Announcements (mod/forum) are scanned: pluginfile attachments and external
+    links (Dropbox / Google Drive / OneDrive / MEGA / WeTransfer) are downloaded;
+    Dropbox folder shares are fetched as zip and PDF/PPT/PPTX inside are extracted
   - Only PDF/PPT/PPTX are downloaded`);
 }
 

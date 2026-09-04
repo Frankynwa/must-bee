@@ -85,6 +85,8 @@ status
   For "always online" commands, suggest `sync` first if the user expects fresh data anyway.
 - **Downloads are limited to PDF / PPT / PPTX**; other extensions are skipped by design.
 - **Download layout:** `mod/folder` resources are downloaded recursively (folder structure preserved); `mod/assign` resources get a named subfolder with intro attachments; other modules are top-level files.
+- **Announcements (mod/forum) are scanned too:** recent discussion posts are opened and (a) Moodle pluginfile attachments and (b) external links (Dropbox / Google Drive / OneDrive / MEGA / WeTransfer — plain-text URLs included) are collected and downloaded. Dropbox share links are auto-converted `dl=0` → `dl=1`; folder shares (zip) are auto-extracted for PDF/PPT/PPTX.
+- **DNS caveat:** some campus networks stall the OS resolver (mDNSResponder) on CDN domains like dropbox.com (`curl` reports "Resolving timed out" while `nslookup` works). must-bee downloads external links via direct DNS queries (Node `dns.Resolver`), so this is handled. For manual downloads use `curl --resolve host:443:<ip-from-nslookup>`.
 - Files live under `$MUSTER_DOWNLOAD_PATH/wemust/<course-folder>/`.
 
 ## Output shapes
@@ -96,7 +98,7 @@ All commands print one JSON value to stdout. Key shapes for parsing:
 | `sync` | `{ runAt, scope, termCode, timetableCourses[], matchedCourses[], scannedCandidates, counts: { added, updated, unchanged, failed }, downloaded[], errors[], timetableFromCache, forWeek? }` |
 | `schedule` | `{ termCode, fromCache, range, lessons[] }` (lesson fields come straight from the timetable API: `courseCode`, `courseName`, `courseEnName`, `lessonDate`, plus extras) |
 | `courses` | `{ source: 'cache' \| 'fresh-sync', termCode, total, courses[] }` — course: `{ courseCode, courseName, moodleUrl, files, lastSynced }` |
-| `course` | `{ courseCode, courseName, moodleUrl, assignments[], quizzes[], materials[] }` — each entry: `{ name, url, updated }` |
+| `course` | `{ courseCode, courseName, moodleUrl, assignments[], quizzes[], materials[], announcements[] }` — material/announcement entries: `{ name, url, updated }` / `{ forumUrl, forumName, posts[] }` (post: `{ title, url, date, attachments }`) |
 | `pending` | `{ total, events[] }` — event: `{ name, dueDate, course, courseUrl, eventType, url }` |
 | `files` (bare or `--course`) | array of `{ courseCode, courseName, moodleUrl, filename, uploadDate, path }`, sorted by `uploadDate` ascending |
 | `files --course --date` | `{ fromCache, prevDate, files[] }` — file: `{ filename, uploadDate, path }` |
