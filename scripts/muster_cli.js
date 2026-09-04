@@ -15,7 +15,7 @@ const TZ = 'Asia/Macau';
 const MOODLE_URL = 'https://moodle.must.edu.mo/';
 const SCHEDULE_URL = 'https://classtimetable-coes-wmweb.must.edu.mo/my-class-timetable-student';
 const DOWNLOAD_ROOT =
-  process.env.MUSTER_DOWNLOAD_PATH || path.join(os.homedir(), '.muduo/wemust');
+  process.env.MUSTER_DOWNLOAD_PATH || path.join(os.homedir(), '.must-bee/wemust');
 const WEMUST_ROOT = path.join(DOWNLOAD_ROOT, 'wemust');
 const TIMETABLE_PATH = path.join(WEMUST_ROOT, '.timetable.json');
 

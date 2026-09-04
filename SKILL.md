@@ -1,5 +1,5 @@
 ---
-name: muduo
+name: must-bee
 description: M.U.S.T. Moodle courseware sync and timetable query. Use when the user asks about M.U.S.T. courses, schedule, assignment deadlines, or downloaded course materials.
 metadata:
   emoji: 🎓
@@ -9,7 +9,7 @@ metadata:
     MUSTER_DOWNLOAD_PATH: ~/Documents/wemust
 ---
 
-# 木铎 muduo
+# must-bee 🐝
 
 Every command prints one JSON object/array to stdout. Errors go to stderr as
 `{"error": "...", "partialReport"?: ...}` with non-zero exit.

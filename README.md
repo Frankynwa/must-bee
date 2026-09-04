@@ -1,6 +1,6 @@
-# muduo（木铎）
+# must-bee 🐝
 
-muduo plugs wemust / Moodle straight into your Agent. Every command emits structured JSON, so any tool-using agent can drive it.
+must-bee plugs wemust / Moodle straight into your Agent. Every command emits structured JSON, so any tool-using agent can drive it.
 
 > *"Did the lecturer upload new slides again?"*
 > *"Which assignment is due tomorrow, again?"*
@@ -38,7 +38,7 @@ muduo plugs wemust / Moodle straight into your Agent. Every command emits struct
 ## Let your Agent install it — just paste this
 
 ````text
-Please install the muduo skill for me: https://github.com/Frankynwa/muduo
+Please install the must-bee skill for me: https://github.com/Frankynwa/must-bee
 
 Follow this workflow:
 1. Clone the repo into your skills directory
