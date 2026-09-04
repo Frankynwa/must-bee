@@ -231,42 +231,97 @@ function isWeekStale(entry, mondayStr, sundayStr) {
   return ageMs > STALE_FUTURE_MS;
 }
 
-// Low-level: call getStudentExamWeb on a page already loaded at SCHEDULE_URL.
+// Low-level: capture the timetable page's own API responses via a hooked XHR.
+// The SPA signs its requests (nonce+signature) internally; we let the page
+// issue them and intercept the JSON responses instead of reverse-engineering
+// the signature or relying on webpack module names (both changed upstream).
+// The page requests one week at a time; we flip weeks to cover [startDate, endDate].
 async function callTimetableApi(page, startDate, endDate) {
-  return page.evaluate(async ({ startDate, endDate }) => {
-    if (!window.__muster_wr) {
-      const chunkKey = Object.keys(window).find(k => k.startsWith('webpackChunk'));
-      if (!chunkKey) throw new Error('webpack chunk not found on page');
-      window[chunkKey].push([['_muster_probe_'], {}, r => { window.__muster_wr = r; }]);
-    }
-    const wr = window.__muster_wr;
-    if (!wr) throw new Error('webpack require not captured');
+  const { mondayStr: firstMonday } = weekBounds(startDate);
+  const { sundayStr: lastSunday } = weekBounds(endDate);
+  const results = [];
+  let cursor = firstMonday;
+  const deadline = Date.now() + 120000;
 
-    let api = null;
-    for (const id of Object.keys(wr.m)) {
-      try {
-        const m = wr(id);
-        if (m && typeof m.getStudentExamWeb === 'function' && typeof m.getMyTerms === 'function') {
-          api = m; break;
-        }
-      } catch (_) {}
-    }
-    if (!api) throw new Error('Lessons API module not found in webpack');
+  while (Date.now() < deadline) {
+    const hit = await page.evaluate(({ cursor }) => {
+      const cap = window.__mustercap || [];
+      for (const c of cap) {
+        if (!c.url.includes('student-exam-webs')) continue;
+        if (!c.url.includes('startDate=' + cursor)) continue;
+        try {
+          const d = JSON.parse(c.body);
+          if (d && d.model) {
+            const m = c.url.match(/termCode=([^&]+)/);
+            return { termCode: m ? decodeURIComponent(m[1]) : null, lessons: d.model.lesson || [] };
+          }
+        } catch (_) { /* keep scanning */ }
+      }
+      return null;
+    }, { cursor });
 
-    let termCode;
-    try {
-      const terms = await api.getMyTerms();
-      if (terms && terms.length) termCode = String(terms[0]);
-    } catch (_) {}
-    if (!termCode) {
-      const el = document.querySelector('.ivu-select input[type="hidden"]');
-      termCode = el ? el.value : null;
+    if (hit) {
+      results.push(hit);
+      const d = new Date(cursor + 'T12:00:00+08:00');
+      d.setDate(d.getDate() + 7);
+      const next = d.toISOString().slice(0, 10);
+      if (next > lastSunday) break;
+      cursor = next;
+      await page.evaluate(() => {
+        const el = document.querySelector('.ivu-icon-ios-arrow-forward');
+        if (el) el.click();
+      });
+      await page.waitForTimeout(2500);
+      continue;
     }
-    if (!termCode) throw new Error('Could not determine termCode');
 
-    const resp = await api.getStudentExamWeb({ termCode, startDate, endDate });
-    return { termCode, lessons: resp.model && resp.model.lesson ? resp.model.lesson : [] };
-  }, { startDate, endDate });
+    // Not captured yet: either the initial request is in flight, or the page
+    // shows a different week — flip toward the cursor week.
+    await page.evaluate(({ cursor }) => {
+      const cap = window.__mustercap || [];
+      const last = [...cap].reverse().find(c => c.url.includes('student-exam-webs'));
+      if (!last) return;
+      const m = last.url.match(/startDate=(\d{4}-\d{2}-\d{2})/);
+      if (!m) return;
+      const pageWeek = m[1];
+      if (pageWeek < cursor) {
+        const el = document.querySelector('.ivu-icon-ios-arrow-forward');
+        if (el) el.click();
+      } else if (pageWeek > cursor) {
+        const el = document.querySelector('.ivu-icon-ios-arrow-back');
+        if (el) el.click();
+      }
+    }, { cursor });
+    await page.waitForTimeout(2500);
+  }
+
+  if (results.length === 0) {
+    throw new Error('Timed out capturing timetable API response for ' + startDate);
+  }
+  const lessons = [];
+  for (const r of results) lessons.push(...r.lessons);
+  return { termCode: results[0].termCode, lessons };
+}
+
+// Inject the XHR hook into every new document of this context.
+// The page issues signed requests; we only read the responses back.
+async function installCapture(context) {
+  await context.addInitScript(() => {
+    const oSend = XMLHttpRequest.prototype.send;
+    if (window.__mustercapHooked) return;
+    window.__mustercapHooked = true;
+    XMLHttpRequest.prototype.send = function () {
+      this.addEventListener('load', () => {
+        try {
+          const u = this.responseURL || '';
+          if (u.includes('x-class-timetable-api')) {
+            (window.__mustercap = window.__mustercap || []).push({ url: u, body: this.responseText });
+          }
+        } catch (_) { /* ignore */ }
+      });
+      return oSend.apply(this, arguments);
+    };
+  });
 }
 
 async function ensureWeekCached(ttState, mondayStr, sundayStr, page, creds) {
@@ -936,6 +991,7 @@ async function cmdSync(options) {
     try {
       browser = await launchBrowser();
       context = await browser.newContext({ acceptDownloads: true });
+      await installCapture(context);
       page = await context.newPage();
 
       // Determine current term: timetable cache → infer from course names
@@ -1000,6 +1056,7 @@ async function syncForWeek(anchorDate, creds) {
   try {
     browser = await launchBrowser();
     context = await browser.newContext({ acceptDownloads: true });
+    await installCapture(context);
     page = await context.newPage();
 
     const lessons = await ensureWeekCached(ttState, mondayStr, sundayStr, page, creds);
@@ -1070,6 +1127,7 @@ async function cmdSchedule(options) {
     try {
       browser = await launchBrowser();
       context = await browser.newContext();
+      await installCapture(context);
       page = await context.newPage();
       await fetchRangeAndCache(page, creds, ttState, startDate, endDate);
       await saveTimetableState(ttState);
@@ -1115,6 +1173,7 @@ async function cmdPending(options) {
   try {
     browser = await launchBrowser();
     context = await browser.newContext();
+    await installCapture(context);
     page = await context.newPage();
 
     const calUrl = new URL('calendar/view.php?view=upcoming', MOODLE_URL).toString();
@@ -1251,6 +1310,7 @@ async function cmdFiles(options) {
           if (!browser) {
             browser = await launchBrowser();
             context = await browser.newContext();
+            await installCapture(context);
             page = await context.newPage();
           }
           try {
@@ -1380,6 +1440,7 @@ async function cmdCourse(options) {
   try {
     browser = await launchBrowser();
     context = await browser.newContext();
+    await installCapture(context);
     page = await context.newPage();
 
     if (!target) {
