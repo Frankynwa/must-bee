@@ -1,12 +1,15 @@
 ---
-name: muster
-description: MUST Moodle courseware sync and timetable query. Use when the user asks about M.U.S.T. courses, schedule, assignment deadlines, or downloaded course materials.
-allowed-tools: Bash(node:*), Bash(npm:*), Bash(npx:*)
+name: muduo
+description: M.U.S.T. Moodle courseware sync and timetable query. Use when the user asks about M.U.S.T. courses, schedule, assignment deadlines, or downloaded course materials.
 metadata:
-  {"openclaw": {"emoji": "🎓", "requires": {"env": ["MUSTER_USERNAME", "MUSTER_PASSWORD"]}, "defaults": {"MUSTER_DOWNLOAD_PATH": "~/.openclaw/workspace-amiya"}}}
+  emoji: 🎓
+  requires:
+    env: [MUSTER_USERNAME, MUSTER_PASSWORD]
+  defaults:
+    MUSTER_DOWNLOAD_PATH: ~/Documents/wemust
 ---
 
-# MUSTer
+# 木铎 muduo
 
 Every command prints one JSON object/array to stdout. Errors go to stderr as
 `{"error": "...", "partialReport"?: ...}` with non-zero exit.
@@ -67,7 +70,7 @@ status
 |---|---|---|
 | `MUSTER_USERNAME` | yes | — |
 | `MUSTER_PASSWORD` | yes | — |
-| `MUSTER_DOWNLOAD_PATH` | no | `~/.openclaw/workspace-amiya` |
+| `MUSTER_DOWNLOAD_PATH` | no | `~/Documents/wemust` |
 
 ## Notes for agents
 

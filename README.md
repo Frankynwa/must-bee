@@ -1,14 +1,12 @@
-# muster_skill
+# muduo（木铎）
 
-> **M.U.S.T. students finally have their own Skill.**
->
+muduo plugs wemust / Moodle straight into your Agent. Every command emits structured JSON, so any tool-using agent can drive it.
+
 > *"Did the lecturer upload new slides again?"*
 > *"Which assignment is due tomorrow, again?"*
 > *"Do I even have class tonight?"*
 >
 > Skip the wemust login — just ask your AI.
-
-muster_skill plugs wemust / Moodle straight into your Agent. Every command emits structured JSON, so any tool-using agent can drive it.
 
 **Languages:** [English](./README.md) · [中文](./README_CN.md)
 
@@ -40,7 +38,7 @@ muster_skill plugs wemust / Moodle straight into your Agent. Every command emits
 ## Let your Agent install it — just paste this
 
 ````text
-Please install the muster_skill for me: https://github.com/Cosmostima/muster_skill
+Please install the muduo skill for me: https://github.com/Frankynwa/muduo
 
 Follow this workflow:
 1. Clone the repo into your skills directory
@@ -90,7 +88,7 @@ node scripts/muster_cli.js schedule
 |---|---|---|---|
 | `MUSTER_USERNAME` | ✅ | — | M.U.S.T. portal username |
 | `MUSTER_PASSWORD` | ✅ | — | M.U.S.T. portal password |
-| `MUSTER_DOWNLOAD_PATH` | optional | `~/.openclaw/workspace-amiya` | Where to store downloaded files and state |
+| `MUSTER_DOWNLOAD_PATH` | optional | `~/Documents/wemust` | Where to store downloaded files and state |
 
 ## Requirements
 
