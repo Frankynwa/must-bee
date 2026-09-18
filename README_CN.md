@@ -76,6 +76,7 @@ node scripts/muster_cli.js schedule
 | `schedule` | 课表 —— *走缓存；未缓存的日期/周会联网拉* | `schedule --date 2026-03-13` |
 | `courses` | 已注册课程列表 —— *走缓存；首次为空会自动 sync* | `courses` |
 | `course` | 单课详情 —— *联网* | `course --code CS101` |
+| `assign` | 单个作业页详情：描述/提交状态/附件 —— *联网* | `assign --code CS101 [--name LAB3]`，或 `assign --url <URL>` |
 | `pending` | 即将到期的作业 —— *联网* | `pending --course CS101` |
 | `files` | 已下载材料检索 —— *走缓存；`--course --date` 可能联网* | `files --course CS101 --date 2026-03-13` |
 | `status` | 同步状态概览 —— *走缓存* | `status` |

@@ -74,6 +74,7 @@ node scripts/muster_cli.js schedule
 | `schedule` | Timetable — *cache; fetches if range not yet cached* | `schedule --date 2026-03-13` |
 | `courses` | List enrolled courses — *cache; auto-syncs on first run* | `courses` |
 | `course` | Single-course detail — *online* | `course --code CS101` |
+| `assign` | One assignment page: description / submission status / attachments — *online* | `assign --code CS101 [--name LAB3]`, or `assign --url <url>` |
 | `pending` | Upcoming assignments — *online* | `pending --course CS101` |
 | `files` | Query downloaded materials — *cache; `--course --date` may fetch* | `files --course CS101 --date 2026-03-13` |
 | `status` | Sync state overview — *cache* | `status` |
