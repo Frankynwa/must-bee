@@ -1815,6 +1815,127 @@ async function cmdCourse(options) {
   }
 }
 
+// ── Command: assign ───────────────────────────────────────────
+//
+// assign --url <moodle assign url>    → fetch one assignment page and dump its
+//                                       description, submission status and
+//                                       attachment list (live; nothing is saved)
+// assign --code COURSECODE [--name X] → resolve a cached course, pick its newest
+//                                       assignment (or one whose name contains X),
+//                                       and dump that page
+
+async function cmdAssign(options) {
+  const creds = ensureCredentials();
+  let assignUrl = options.url ? String(options.url) : null;
+  let courseOut = null;
+
+  let browser, context, page;
+  try {
+    browser = await launchBrowser();
+    context = await browser.newContext({ acceptDownloads: true });
+    await installCapture(context);
+    page = await context.newPage();
+
+    if (!assignUrl) {
+      if (!options.code) throw new Error('assign requires --url <url> or --code COURSECODE');
+      const codeUpper = String(options.code).toUpperCase();
+
+      let entries = [];
+      try { entries = await fsp.readdir(WEMUST_ROOT, { withFileTypes: true }); } catch { }
+      let target = null;
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        const state = await loadCourseState(path.join(WEMUST_ROOT, entry.name));
+        if (state.courseCode && state.courseCode.toUpperCase() === codeUpper) {
+          target = { courseCode: state.courseCode, courseName: state.courseName, url: state.moodleUrl };
+          break;
+        }
+      }
+      if (!target) throw new Error(`Course '${options.code}' not found in cache. Run 'sync' first or use --url.`);
+
+      const resourceLinks = await listResourceLinks(page, target.url, creds);
+      const seenModIds = new Set();
+      const assigns = [];
+      for (const link of resourceLinks) {
+        if (!link.url.includes('/mod/assign/view.php')) continue;
+        const modId = extractModId(link.url);
+        if (!modId || seenModIds.has(modId)) continue;
+        seenModIds.add(modId);
+        assigns.push({ id: modId, name: link.name, url: `${MOODLE_URL}mod/assign/view.php?id=${modId}` });
+      }
+      if (!assigns.length) throw new Error('No assignments found for this course.');
+
+      let chosen = assigns[assigns.length - 1];
+      if (options.name) {
+        const needle = String(options.name).toLowerCase();
+        const hit = assigns.find((a) => a.name.toLowerCase().includes(needle));
+        if (hit) chosen = hit;
+      }
+      courseOut = { courseCode: target.courseCode, courseName: target.courseName, assignments: assigns };
+      assignUrl = chosen.url;
+    }
+
+    await gotoAndAuth(page, assignUrl, creds);
+
+    const grabText = async (selectors) => {
+      for (const sel of selectors) {
+        try {
+          const el = page.locator(sel).first();
+          if ((await el.count()) === 0) continue;
+          const value = await el.innerText({ timeout: 4000 }).catch(() => '');
+          if (value && value.trim()) return value;
+        } catch { /* try the next selector */ }
+      }
+      return '';
+    };
+    const cleanBlock = (value) => String(value || '')
+      .replace(/\r/g, '')
+      .replace(/[ \t]+\n/g, '\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+
+    const title = cleanBlock(await grabText(['.page-header-headings h1', '.page-header-headings', 'h1', 'h2']));
+    const description = cleanBlock(await grabText(['#intro', '.activity-description', '.box.generalbox']));
+    const status = cleanBlock(await grabText([
+      '.submissionstatustable',
+      '[data-region="submission-status"]',
+      '[data-region="activity-dates"]',
+      '#dates'
+    ]));
+
+    const rawAttachments = await page
+      .locator('a[href*="pluginfile.php"], a[href*="forcedownload"]')
+      .evaluateAll((list) => list.map((a) => ({
+        name: (a.textContent || '').replace(/\s+/g, ' ').trim(),
+        url: a.getAttribute('href') || ''
+      })))
+      .catch(() => []);
+    const seenAtt = new Set();
+    const attachments = [];
+    for (const item of rawAttachments) {
+      const key = item.url ? normalizeFileUrl(item.url) : item.name;
+      if (!key || seenAtt.has(key)) continue;
+      seenAtt.add(key);
+      attachments.push({ name: item.name, url: item.url, normalizedUrl: key });
+    }
+
+    return {
+      url: assignUrl,
+      title,
+      description,
+      status,
+      attachments,
+      ...(courseOut
+        ? { course: { courseCode: courseOut.courseCode, courseName: courseOut.courseName }, allAssignments: courseOut.assignments }
+        : {})
+    };
+  } finally {
+    if (page) await page.close().catch(() => {});
+    if (context) await context.close().catch(() => {});
+    if (browser) await browser.close().catch(() => {});
+  }
+}
+
 // ── Command: notes ─────────────────────────────────────────────────────────────
 //
 // notes                        → generate Obsidian review notes for every
@@ -1933,6 +2054,7 @@ function printUsage() {
   node scripts/muster_cli.js schedule [--date YYYY-MM-DD] [--week [YYYY-MM-DD]]
   node scripts/muster_cli.js courses
   node scripts/muster_cli.js course --code COURSECODE
+  node scripts/muster_cli.js assign --url URL | --code COURSECODE [--name TEXT]
   node scripts/muster_cli.js pending [--course COURSECODE]
   node scripts/muster_cli.js files [--course COURSECODE] [--date YYYY-MM-DD] [--recent [--n N]]
   node scripts/muster_cli.js notes [--course COURSECODE] [--dry-run] [--force] [--limit N]
@@ -1947,6 +2069,8 @@ Examples:
   schedule --week               show this week's timetable
   courses                       list every enrolled course (auto-syncs on first run)
   course --code CS101           show CS101 assignments / quizzes / recent materials (live)
+  assign --code CS101           dump CS101's newest assignment (description / due / attachments)
+  assign --url <url>            dump one specific Moodle assignment page
   pending                       show all upcoming Moodle assignments/events
   files --course CS101          show all downloaded files for CS101
   files --course CS101 --date 2026-03-13   show files between the previous class and that date
@@ -1980,6 +2104,7 @@ async function main() {
   else if (cmd === 'files')    result = await cmdFiles(options);
   else if (cmd === 'courses')  result = await cmdCourses(options);
   else if (cmd === 'course')   result = await cmdCourse(options);
+  else if (cmd === 'assign')   result = await cmdAssign(options);
   else if (cmd === 'notes')    result = await cmdNotes(options);
   else if (cmd === 'status')   result = await cmdStatus();
   else throw new Error(`Unknown command '${cmd}'. Run with --help for usage.`);
