@@ -2295,6 +2295,43 @@ async function cmdLinks(options) {
   }
 }
 
+// ── Command: get ──────────────────────────────────────────────────────────────
+//
+// get --url <pluginfile/forcedownload URL> [--out DIR]
+//   → download one file through the authenticated browser session.
+//     Default output dir: <MUSTER_DOWNLOAD_PATH>/_inbox
+
+async function cmdGet(options) {
+  if (!options.url) throw new Error('get requires --url <file URL>');
+  const fileUrl = String(options.url);
+  const outDir = options.out ? String(options.out) : path.join(DOWNLOAD_ROOT, '_inbox');
+  await fsp.mkdir(outDir, { recursive: true });
+
+  const creds = ensureCredentials();
+  let browser, context, page;
+  try {
+    browser = await launchBrowser();
+    context = await browser.newContext({ acceptDownloads: true });
+    page = await context.newPage();
+    // establish the Moodle session first, otherwise pluginfile URLs redirect to CAS
+    await gotoAndAuth(page, new URL('/my/', MOODLE_URL).toString(), creds);
+
+    const [download] = await Promise.all([
+      page.waitForEvent('download', { timeout: 60000 }),
+      page.goto(fileUrl, { waitUntil: 'commit', timeout: 60000 }).catch(() => {})
+    ]);
+    const name = safeFilename(download.suggestedFilename() || path.basename(new URL(fileUrl).pathname) || 'download.bin');
+    const dest = path.join(outDir, name);
+    await download.saveAs(dest);
+    const stat = await fsp.stat(dest).catch(() => null);
+    return { url: fileUrl, saved: dest, bytes: stat ? stat.size : null };
+  } finally {
+    if (page) await page.close().catch(() => {});
+    if (context) await context.close().catch(() => {});
+    if (browser) await browser.close().catch(() => {});
+  }
+}
+
 // ── Command: notes ─────────────────────────────────────────────────────────────
 //
 // notes                        → generate Obsidian review notes for every
@@ -2468,6 +2505,7 @@ async function main() {
   else if (cmd === 'post')     result = await cmdPost(options);
   else if (cmd === 'forum')    result = await cmdForum(options);
   else if (cmd === 'links')    result = await cmdLinks(options);
+  else if (cmd === 'get')      result = await cmdGet(options);
   else if (cmd === 'notes')    result = await cmdNotes(options);
   else if (cmd === 'status')   result = await cmdStatus();
   else throw new Error(`Unknown command '${cmd}'. Run with --help for usage.`);
