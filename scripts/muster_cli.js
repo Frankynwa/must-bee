@@ -959,8 +959,14 @@ function extractZipFiles(buffer) {
 
 async function listForumLinks(page, courseUrl, creds) {
   await gotoAndAuth(page, courseUrl, creds);
+  await page.waitForLoadState('load').catch(() => {});
+  await page.waitForTimeout(1500);
+  await page.waitForFunction(
+    () => document.querySelectorAll('a[href*="/mod/"]').length > 0,
+    { timeout: 15000 }
+  ).catch(() => {});
   const rawLinks = await page.evaluate(() =>
-    Array.from(document.querySelectorAll('a[href*="/mod/forum/view.php"]'))
+    Array.from(document.querySelectorAll('a[href*="/mod/forum/"]'))
       .map(a => ({ href: a.getAttribute('href'), text: a.textContent || '' }))
       .filter(x => x.href)
   );
@@ -1905,6 +1911,8 @@ async function cmdAssign(options) {
     }
 
     await gotoAndAuth(page, assignUrl, creds);
+    await page.waitForLoadState('load').catch(() => {});
+    const pageDebug = { finalUrl: page.url(), pageTitle: await page.title().catch(() => ''), readyState: await page.evaluate(() => document.readyState).catch(() => '') };
 
     const grabText = async (selectors) => {
       for (const sel of selectors) {
@@ -1931,6 +1939,9 @@ async function cmdAssign(options) {
       '[data-region="activity-dates"]',
       '#dates'
     ]));
+    // Fallback: whole main region, for Moodle themes where the selectors above
+    // miss (role="main" region always holds the activity body).
+    const fallback = cleanBlock(await grabText(['#region-main', '[role="main"]', 'main'])).slice(0, 4000);
 
     const rawAttachments = await page
       .locator('a[href*="pluginfile.php"], a[href*="forcedownload"]')
@@ -1953,6 +1964,8 @@ async function cmdAssign(options) {
       title,
       description,
       status,
+      fallback,
+      pageDebug,
       attachments,
       ...(courseOut
         ? { course: { courseCode: courseOut.courseCode, courseName: courseOut.courseName }, allAssignments: courseOut.assignments }
@@ -2058,6 +2071,223 @@ async function cmdPost(options) {
     });
 
     return { url: postUrl, ...info };
+  } finally {
+    if (page) await page.close().catch(() => {});
+    if (context) await context.close().catch(() => {});
+    if (browser) await browser.close().catch(() => {});
+  }
+}
+
+// ── Command: forum ────────────────────────────────────────────────────────────
+//
+// forum --code COURSECODE [--bodies]  → list EVERY discussion thread in every
+//   forum of the course (no maxPosts cap), optionally with full post bodies.
+// forum --url <forum view.php url> [--bodies]
+
+async function cmdForum(options) {
+  const creds = ensureCredentials();
+  let forumUrls = [];
+  let courseInfo = null;
+
+  if (options.url) {
+    forumUrls = [{ url: String(options.url), name: null }];
+  } else {
+    if (!options.code) throw new Error('forum requires --code COURSECODE or --url <forum url>');
+    const codeUpper = String(options.code).toUpperCase();
+
+    let entries = [];
+    try { entries = await fsp.readdir(WEMUST_ROOT, { withFileTypes: true }); } catch { }
+    let target = null;
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const state = await loadCourseState(path.join(WEMUST_ROOT, entry.name));
+      if (state.courseCode && state.courseCode.toUpperCase() === codeUpper) {
+        target = { courseCode: state.courseCode, courseName: state.courseName, url: state.moodleUrl };
+        break;
+      }
+    }
+    courseInfo = target;
+    if (!target) {
+      // fall back to the live dashboard scan
+      let browser0, page0;
+      try {
+        const b0 = await launchBrowser();
+        const c0 = await b0.newContext();
+        page0 = await c0.newPage();
+        const live = await listMoodleCourses(page0, creds);
+        const hit = live.find(c => c.name.toUpperCase().includes(codeUpper));
+        if (hit) {
+          courseInfo = { courseCode: codeUpper, courseName: hit.name, url: hit.url };
+        }
+        await page0.close().catch(() => {});
+        await c0.close().catch(() => {});
+        await b0.close().catch(() => {});
+      } catch { /* ignore, handled below */ }
+      if (!courseInfo) throw new Error(`Course '${options.code}' not found (cache miss + live scan miss).`);
+    }
+    forumUrls = null; // resolved below with the browser open
+  }
+
+  let browser, context, page;
+  try {
+    browser = await launchBrowser();
+    context = await browser.newContext();
+    page = await context.newPage();
+
+    if (!forumUrls) {
+      forumUrls = await listForumLinks(page, courseInfo.url, creds);
+    }
+
+    const forums = [];
+    const queue = [...forumUrls];
+    const visited = new Set();
+    while (queue.length) {
+      const forum = queue.shift();
+      if (!forum || visited.has(forum.url)) continue;
+      visited.add(forum.url);
+      await gotoAndAuth(page, forum.url, creds);
+      await page.waitForLoadState('load').catch(() => {});
+      await page.waitForTimeout(800);
+
+      const threads = await page.evaluate(() => {
+        const seen = new Set();
+        const out = [];
+        for (const a of document.querySelectorAll('a[href*="/mod/forum/discuss.php"]')) {
+          const href = a.getAttribute('href');
+          if (!href) continue;
+          try {
+            const u = new URL(href, location.href);
+            u.searchParams.delete('parent');
+            if (seen.has(u.toString())) continue;
+            seen.add(u.toString());
+            out.push({ url: u.toString(), title: (a.textContent || '').replace(/\s+/g, ' ').trim() });
+          } catch { /* skip */ }
+        }
+        return out;
+      });
+
+      // A forum index page (mod/forum/index.php) lists sub-forums instead of threads
+      const subForums = await page.evaluate(() => {
+        const seen = new Set();
+        const out = [];
+        for (const a of document.querySelectorAll('a[href*="/mod/forum/view.php"]')) {
+          const href = a.getAttribute('href');
+          if (!href) continue;
+          try {
+            const u = new URL(href, location.href).toString();
+            if (seen.has(u)) continue;
+            seen.add(u);
+            out.push({ url: u, name: (a.textContent || '').replace(/\s+/g, ' ').trim() });
+          } catch { /* skip */ }
+        }
+        return out;
+      });
+
+      const posts = [];
+      if (options.bodies) {
+        for (const th of threads) {
+          await gotoAndAuth(page, th.url, creds);
+          await page.waitForLoadState('load').catch(() => {});
+          await page.waitForTimeout(600);
+          const info = await page.evaluate(() => {
+            const clean = (s) => String(s || '').replace(/\r/g, '').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+            const txt = (el) => { try { return el ? String(el.innerText || el.textContent || '') : ''; } catch (e) { return ''; } };
+            return Array.from(document.querySelectorAll('.forumpost')).map((fp) => {
+              const contentEl = fp.querySelector('[data-region="post-content"], .post-content-container, .no-overflow') || fp;
+              const authorEl = fp.querySelector('.author .usertext, .author a, .author');
+              const subjectEl = fp.querySelector('.subject, h3');
+              const timeEl = fp.querySelector('time');
+              return {
+                author: clean(txt(authorEl)),
+                date: (timeEl && (timeEl.getAttribute('datetime') || timeEl.getAttribute('data-timestamp'))) || null,
+                body: clean(txt(contentEl)).slice(0, 4000)
+              };
+            });
+          });
+          if (info.length) {
+            posts.push({ title: th.title, url: th.url, ...info[0], replies: info.slice(1) });
+          }
+        }
+      }
+
+      if (threads.length === 0) {
+        for (const sf of subForums) {
+          if (!visited.has(sf.url)) queue.push({ url: sf.url, name: sf.name });
+        }
+      }
+
+      forums.push({
+        forumUrl: forum.url,
+        forumName: forum.name,
+        subForumCount: subForums.length,
+        threadCount: threads.length,
+        threads: options.bodies ? posts : threads
+      });
+    }
+
+    return { course: courseInfo, forums };
+  } finally {
+    if (page) await page.close().catch(() => {});
+    if (context) await context.close().catch(() => {});
+    if (browser) await browser.close().catch(() => {});
+  }
+}
+
+// ── Command: links ────────────────────────────────────────────────────────────
+//
+// links --code COURSECODE   → every activity/resource link on the course page
+//                             (mod type, name, url, last updated) — catches
+//                             mod/url, mod/page, mod/label items that
+//                             'course' does not report.
+
+async function cmdLinks(options) {
+  if (!options.code) throw new Error('links requires --code COURSECODE');
+  const codeUpper = String(options.code).toUpperCase();
+  const creds = ensureCredentials();
+
+  let entries = [];
+  try { entries = await fsp.readdir(WEMUST_ROOT, { withFileTypes: true }); } catch { }
+  let target = null;
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const state = await loadCourseState(path.join(WEMUST_ROOT, entry.name));
+    if (state.courseCode && state.courseCode.toUpperCase() === codeUpper) {
+      target = { courseCode: state.courseCode, courseName: state.courseName, url: state.moodleUrl };
+      break;
+    }
+  }
+
+  let browser, context, page;
+  try {
+    browser = await launchBrowser();
+    context = await browser.newContext();
+    page = await context.newPage();
+
+    if (!target) {
+      const live = await listMoodleCourses(page, creds);
+      const hit = live.find(c => c.name.toUpperCase().includes(codeUpper));
+      if (!hit) throw new Error(`Course '${options.code}' not found (cache + live scan).`);
+      target = { courseCode: codeUpper, courseName: hit.name, url: hit.url };
+    }
+
+    const links = await listResourceLinks(page, target.url, creds);
+    await page.waitForLoadState('load').catch(() => {});
+    const modTimestamps = await fetchModuleTimestamps(
+      page,
+      target.url,
+      links.filter(l => l.url.includes('/mod/')).map(l => l.url)
+    ).catch(() => new Map());
+
+    const items = links
+      .filter(l => l.url.includes('/mod/') || l.url.includes('/course/section'))
+      .map(l => {
+        const modId = extractModId(l.url);
+        const ts = modId ? modTimestamps.get(modId) : null;
+        const type = (l.url.match(/\/mod\/([a-z]+)\//) || [])[1] || 'section';
+        return { type, name: l.name, url: l.url, updated: ts ? unixToDate(ts) : null };
+      });
+
+    return { course: target, count: items.length, items };
   } finally {
     if (page) await page.close().catch(() => {});
     if (context) await context.close().catch(() => {});
@@ -2236,6 +2466,8 @@ async function main() {
   else if (cmd === 'course')   result = await cmdCourse(options);
   else if (cmd === 'assign')   result = await cmdAssign(options);
   else if (cmd === 'post')     result = await cmdPost(options);
+  else if (cmd === 'forum')    result = await cmdForum(options);
+  else if (cmd === 'links')    result = await cmdLinks(options);
   else if (cmd === 'notes')    result = await cmdNotes(options);
   else if (cmd === 'status')   result = await cmdStatus();
   else throw new Error(`Unknown command '${cmd}'. Run with --help for usage.`);
