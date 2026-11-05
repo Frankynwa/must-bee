@@ -608,6 +608,12 @@ function matchCourses(targetCourses, moodleCourses) {
 
 async function listMoodleCourses(page, creds, termFilter) {
   await gotoAndAuth(page, new URL('/my/', MOODLE_URL).toString(), creds);
+  await page.waitForLoadState('load').catch(() => {});
+  await page.waitForTimeout(2000);
+  await page.waitForFunction(
+    () => document.querySelectorAll('a[href*="/course/view.php"]').length > 0,
+    { timeout: 15000 }
+  ).catch(() => {});
 
   const rawLinks = await page.evaluate(() =>
     Array.from(document.querySelectorAll('a.aalink.coursename, .course-title a, a[href*="/course/view.php"]'))
@@ -1688,7 +1694,30 @@ async function cmdFiles(options) {
 // Returns: { source: 'cache'|'fresh-sync', termCode, total, courses[] }
 // Each course: { courseCode, courseName, moodleUrl, files, lastSynced }
 
-async function cmdCourses() {
+async function cmdCourses(options = {}) {
+  // --live: ignore the local cache and scan the Moodle dashboard directly
+  // (useful when a course's .muster.json is unreadable / iCloud-evicted).
+  if (options.live) {
+    const creds = ensureCredentials();
+    let browser, context, page;
+    try {
+      browser = await launchBrowser();
+      context = await browser.newContext();
+      page = await context.newPage();
+      const live = await listMoodleCourses(page, creds);
+      return {
+        source: 'live',
+        termCode: null,
+        total: live.length,
+        courses: live.map(c => ({ courseCode: null, courseName: c.name, moodleUrl: c.url, files: null, lastSynced: null }))
+      };
+    } finally {
+      if (page) await page.close().catch(() => {});
+      if (context) await context.close().catch(() => {});
+      if (browser) await browser.close().catch(() => {});
+    }
+  }
+
   let entries = [];
   try { entries = await fsp.readdir(WEMUST_ROOT, { withFileTypes: true }); } catch { }
 
@@ -1936,6 +1965,106 @@ async function cmdAssign(options) {
   }
 }
 
+// ── Command: post ─────────────────────────────────────────────────────────────
+//
+// post --url <discuss.php url>          → dump one forum announcement's title,
+//                                         author, date and body text (live)
+// post --code COURSECODE [--name TEXT]  → pick the newest announcement of that
+//                                         course (or one whose title matches)
+
+async function cmdPost(options) {
+  const creds = ensureCredentials();
+  let postUrl = options.url ? String(options.url) : null;
+
+  let browser, context, page;
+  try {
+    browser = await launchBrowser();
+    context = await browser.newContext();
+    page = await context.newPage();
+
+    if (!postUrl) {
+      if (!options.code) throw new Error('post requires --url <url> or --code COURSECODE [--name TEXT]');
+      const codeUpper = String(options.code).toUpperCase();
+
+      let entries = [];
+      try { entries = await fsp.readdir(WEMUST_ROOT, { withFileTypes: true }); } catch { }
+      let target = null;
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        const state = await loadCourseState(path.join(WEMUST_ROOT, entry.name));
+        if (state.courseCode && state.courseCode.toUpperCase() === codeUpper) {
+          target = { courseCode: state.courseCode, courseName: state.courseName, url: state.moodleUrl };
+          break;
+        }
+      }
+      if (!target) throw new Error(`Course '${options.code}' not found in cache. Run 'sync' first or use --url.`);
+
+      const forums = await listForumLinks(page, target.url, creds);
+      const seen = new Set();
+      const links = [];
+      for (const forum of forums) {
+        await gotoAndAuth(page, forum.url, creds);
+        const found = await page.evaluate(() => Array.from(document.querySelectorAll('a[href*="/mod/forum/discuss.php"]'))
+          .map(a => ({ url: a.href, title: (a.textContent || '').replace(/\s+/g, ' ').trim() })));
+        for (const item of found) {
+          if (seen.has(item.url)) continue;
+          seen.add(item.url);
+          links.push(item);
+        }
+      }
+      const needle = options.name ? String(options.name).toLowerCase() : '';
+      const chosen = needle
+        ? links.find(l => l.title.toLowerCase().includes(needle))
+        : links[0];
+      if (!chosen) throw new Error('No matching announcement post found.');
+      postUrl = chosen.url;
+    }
+
+    await gotoAndAuth(page, postUrl, creds);
+    await page.waitForLoadState('load').catch(() => {});
+    await page.waitForTimeout(1500);
+
+    const info = await page.evaluate(() => {
+      const clean = (s) => String(s || '')
+        .replace(/\r/g, '')
+        .replace(/[ \t]+\n/g, '\n')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+      const txt = (el) => { try { return el ? String(el.innerText || el.textContent || '') : ''; } catch (e) { return ''; } };
+      const heading = document.querySelector('.page-header-headings h1') || document.querySelector('h1');
+      const posts = Array.from(document.querySelectorAll('.forumpost, article[data-post-id], [data-region="post"]')).map((fp) => {
+        const contentEl = fp.querySelector('[data-region="post-content"], .post-content-container, .no-overflow') || fp;
+        const authorEl = fp.querySelector('.author .usertext, .author a, .author, [data-region="author"]');
+        const subjectEl = fp.querySelector('.subject, h3, [data-region="subject"]');
+        const timeEl = fp.querySelector('time');
+        const raw = timeEl && (timeEl.getAttribute('datetime') || timeEl.getAttribute('data-timestamp'));
+        return {
+          subject: clean(txt(subjectEl)),
+          author: clean(txt(authorEl)),
+          date: raw || null,
+          body: clean(txt(contentEl))
+        };
+      });
+      const mainEl = document.querySelector('#region-main, [role="main"], main');
+      const fallback = clean(txt(mainEl || document.body || document.documentElement)).slice(0, 4000);
+      const counts = {
+        forumpost: document.querySelectorAll('.forumpost').length,
+        postContent: document.querySelectorAll('.post-content-container, [data-region="post-content"]').length,
+        article: document.querySelectorAll('article[data-post-id]').length,
+        bodyChildren: document.body ? document.body.children.length : -1,
+        readyState: document.readyState
+      };
+      return { pageTitle: document.title, title: clean(txt(heading)), posts, fallback, counts };
+    });
+
+    return { url: postUrl, ...info };
+  } finally {
+    if (page) await page.close().catch(() => {});
+    if (context) await context.close().catch(() => {});
+    if (browser) await browser.close().catch(() => {});
+  }
+}
+
 // ── Command: notes ─────────────────────────────────────────────────────────────
 //
 // notes                        → generate Obsidian review notes for every
@@ -2055,6 +2184,7 @@ function printUsage() {
   node scripts/muster_cli.js courses
   node scripts/muster_cli.js course --code COURSECODE
   node scripts/muster_cli.js assign --url URL | --code COURSECODE [--name TEXT]
+  node scripts/muster_cli.js post --url URL | --code COURSECODE [--name TEXT]
   node scripts/muster_cli.js pending [--course COURSECODE]
   node scripts/muster_cli.js files [--course COURSECODE] [--date YYYY-MM-DD] [--recent [--n N]]
   node scripts/muster_cli.js notes [--course COURSECODE] [--dry-run] [--force] [--limit N]
@@ -2105,6 +2235,7 @@ async function main() {
   else if (cmd === 'courses')  result = await cmdCourses(options);
   else if (cmd === 'course')   result = await cmdCourse(options);
   else if (cmd === 'assign')   result = await cmdAssign(options);
+  else if (cmd === 'post')     result = await cmdPost(options);
   else if (cmd === 'notes')    result = await cmdNotes(options);
   else if (cmd === 'status')   result = await cmdStatus();
   else throw new Error(`Unknown command '${cmd}'. Run with --help for usage.`);
