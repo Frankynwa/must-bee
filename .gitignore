@@ -6,6 +6,21 @@ node_modules/
 .env.*
 !.env.example
 
+# Downloaded courseware / sync state
+.must-bee/
+_inbox/
+wemust/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Test / coverage output
+coverage/
+.nyc_output/
+
 # OS junk
 .DS_Store
 Thumbs.db
@@ -17,3 +32,6 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Temp files
+*.tmp

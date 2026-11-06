@@ -1,0 +1,47 @@
+name: Bug report
+description: Something broke or produced the wrong result
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Do not paste credentials, cookies, or student data.** Redact them from
+        logs. Security issues belong in a private advisory, not here — see
+        SECURITY.md.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Command you ran, expected result, actual result.
+      placeholder: |
+        node scripts/muster_cli.js course --code CS482
+        Expected ... but got ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: must-bee version
+      description: Output of `node scripts/muster_cli.js --version`
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: OS
+      options:
+        - macOS
+        - Linux
+        - Windows
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output
+      description: stderr JSON or `--debug` traces. Remove secrets first.
+      render: shell
+    validations:
+      required: false

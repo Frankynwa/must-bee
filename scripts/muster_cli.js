@@ -1,113 +1,77 @@
 #!/usr/bin/env node
 'use strict';
 
-const crypto = require('crypto');
 const fs = require('fs');
 const fsp = fs.promises;
 const os = require('os');
 const path = require('path');
-const http = require('http');
-const https = require('https');
-const dns = require('dns');
-const AdmZip = require('adm-zip');
 const { chromium } = require('playwright');
+const {
+  MOODLE_URL,
+  FILE_EXT_RE,
+  isoNow,
+  macauDateOffset,
+  validateDate,
+  normalizeText,
+  normalizeFileUrl,
+  fingerprint,
+  safeFilename,
+  compactError,
+  courseDirName,
+  deriveCourseCode,
+  weekBounds,
+  weekKey,
+  isWeekStale,
+  getLessonDatesForCourse,
+  extractModId,
+  unixToDate,
+  matchCourses,
+  isMoodleHost,
+  isHttpUrl,
+  parseCli,
+  responseContentLength,
+  inferFileNameFromHeaders
+} = require('./lib/core');
+const {
+  EXTERNAL_FILE_HOSTS,
+  isExternalFileHost,
+  dropboxDirectUrl,
+  httpGetExternal,
+  extractZipFiles
+} = require('./lib/net');
+const pkg = require('../package.json');
 
 let DEBUG = false;
 function dbg(...args) { if (DEBUG) process.stderr.write('[debug] ' + args.join(' ') + '\n'); }
 
-const TZ = 'Asia/Macau';
-const MOODLE_URL = 'https://moodle.must.edu.mo/';
 const SCHEDULE_URL = 'https://classtimetable-coes-wmweb.must.edu.mo/my-class-timetable-student';
 const DOWNLOAD_ROOT =
-  process.env.MUSTER_DOWNLOAD_PATH || path.join(os.homedir(), '.must-bee/wemust');
-const WEMUST_ROOT = path.join(DOWNLOAD_ROOT, 'wemust');
+  process.env.MUSTER_DOWNLOAD_PATH || path.join(os.homedir(), '.must-bee');
+
+// Older builds defaulted to ~/.must-bee/wemust and then appended another
+// "wemust", producing ~/.must-bee/wemust/wemust. Keep that data reachable after
+// the default changed to ~/.must-bee.
+function detectWemustRoot(downloadRoot) {
+  const direct = path.join(downloadRoot, 'wemust');
+  const nested = path.join(direct, 'wemust');
+  const hasCourseState = (dir) => {
+    try {
+      if (fs.existsSync(path.join(dir, '.timetable.json'))) return true;
+      return fs.readdirSync(dir, { withFileTypes: true }).some(
+        (entry) => entry.isDirectory() && fs.existsSync(path.join(dir, entry.name, '.muster.json'))
+      );
+    } catch {
+      return false;
+    }
+  };
+  if (!hasCourseState(direct) && hasCourseState(nested)) return nested;
+  return direct;
+}
+
+const WEMUST_ROOT = detectWemustRoot(DOWNLOAD_ROOT);
 const TIMETABLE_PATH = path.join(WEMUST_ROOT, '.timetable.json');
 
-const TRANSIENT_QUERY_PARAMS = new Set([
-  'token', 'forcedownload', 'download', 'time', 'expires', 'signature',
-  'sesskey', 'redirect', 'cache', 't', '_'
-]);
-
-const FILE_EXT_RE = /\.(pdf|ppt|pptx)$/i;
-
-// Staleness thresholds for timetable weeks
-const STALE_CURRENT_MS = 6 * 3600 * 1000;   // current week: 6 hours
-const STALE_FUTURE_MS  = 24 * 3600 * 1000;  // future weeks: 24 hours
-// Past weeks: never stale
-
-// ── Utilities ────────────────────────────────────────────────────────────────
-
-function isoNow() {
-  return new Date().toISOString();
-}
-
-function ensureCredentials() {
-  const username = process.env.MUSTER_USERNAME;
-  const password = process.env.MUSTER_PASSWORD;
-  if (!username || !password) {
-    throw new Error('MUSTER_USERNAME and MUSTER_PASSWORD are required.');
-  }
-  return { username, password };
-}
-
-function macauDateOffset(days) {
-  const base = new Date(Date.now() + days * 86400000);
-  const parts = new Intl.DateTimeFormat('en-CA', {
-    timeZone: TZ,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit'
-  }).formatToParts(base);
-  const year = parts.find((p) => p.type === 'year').value;
-  const month = parts.find((p) => p.type === 'month').value;
-  const day = parts.find((p) => p.type === 'day').value;
-  return `${year}-${month}-${day}`;
-}
-
-function validateDate(date) {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
-    throw new Error(`Invalid date '${date}'. Expected YYYY-MM-DD.`);
-  }
-}
-
-function normalizeText(value) {
-  return String(value || '').replace(/\s+/g, ' ').trim();
-}
-
-function normalizeFileUrl(rawUrl) {
-  try {
-    const resolved = new URL(rawUrl, MOODLE_URL);
-    const out = new URL(`${resolved.origin}${resolved.pathname}`);
-    const kept = new URLSearchParams();
-    for (const [key, value] of resolved.searchParams.entries()) {
-      if (!TRANSIENT_QUERY_PARAMS.has(key.toLowerCase())) {
-        kept.append(key, value);
-      }
-    }
-    const sorted = [...kept.entries()].sort((a, b) => a[0].localeCompare(b[0]));
-    if (sorted.length > 0 && !resolved.pathname.includes('pluginfile.php')) {
-      out.search = new URLSearchParams(sorted).toString();
-    }
-    return out.toString();
-  } catch {
-    return rawUrl;
-  }
-}
-
-function fingerprint(courseUrl, normalizedFileUrl, filename) {
-  const payload = `${courseUrl}|${normalizedFileUrl}|${filename}`;
-  return crypto.createHash('sha256').update(payload).digest('hex');
-}
-
-function safeFilename(name) {
-  return name.replace(/[\\/:*?"<>|]/g, '_').slice(0, 240);
-}
-
-function compactError(err) {
-  const text = String(err && (err.message || err) ? err.message || err : err || '');
-  const first = text.split('\n')[0];
-  return first.slice(0, 400);
-}
+// ── Local helpers ────────────────────────────────────────────────────────────
 
 async function withRetry(fn, retries = 2, delayMs = 1500) {
   let lastErr;
@@ -134,18 +98,40 @@ async function ensureUniquePath(filePath) {
   return path.join(dir, `${base}_${Date.now()}${ext}`);
 }
 
-// ── Course state helpers ─────────────────────────────────────────────────────
+// ── Credentials ──────────────────────────────────────────────────────────────
 
-function courseDirName(courseCode, courseName) {
-  const raw = courseCode ? `${courseCode}-${courseName}` : courseName;
-  return safeFilename(raw);
+function ensureCredentials() {
+  const username = process.env.MUSTER_USERNAME;
+  const password = process.env.MUSTER_PASSWORD;
+  if (!username || !password) {
+    throw new Error('MUSTER_USERNAME and MUSTER_PASSWORD are required.');
+  }
+  return { username, password };
 }
+
+function requireMoodleUrl(value, label) {
+  const raw = String(value || '');
+  if (!isHttpUrl(raw)) throw new Error(`${label} must be an http(s) URL`);
+  const host = new URL(raw).hostname;
+  if (!isMoodleHost(host)) {
+    throw new Error(`${label} must be a M.U.S.T. Moodle URL (got ${host})`);
+  }
+  return raw;
+}
+
+// ── Course state helpers ─────────────────────────────────────────────────────
 
 async function loadCourseState(courseDir) {
   const jsonPath = path.join(courseDir, '.muster.json');
   try {
     const raw = await fsp.readFile(jsonPath, 'utf8');
-    return JSON.parse(raw);
+    const state = JSON.parse(raw);
+    if (!state || typeof state !== 'object') throw new Error('bad state');
+    // Older `sync --all` runs stored the Moodle course name but no code.
+    // Recover it on read so `course --code CS482` works without a re-sync.
+    if (!state.courseCode) state.courseCode = deriveCourseCode(state.courseName);
+    if (!Array.isArray(state.files)) state.files = [];
+    return state;
   } catch {
     return { courseCode: '', courseName: '', moodleUrl: '', lastSynced: null, files: [] };
   }
@@ -157,6 +143,23 @@ async function saveCourseState(courseDir, state) {
   const tmp = jsonPath + '.tmp';
   await fsp.writeFile(tmp, JSON.stringify(state, null, 2), 'utf8');
   await fsp.rename(tmp, jsonPath);
+}
+
+// Resolve a course code against the local .muster.json cache.
+// Returns { courseCode, courseName, url } or null.
+async function findCachedCourseByCode(code) {
+  const codeUpper = String(code || '').toUpperCase();
+  if (!codeUpper) return null;
+  let entries = [];
+  try { entries = await fsp.readdir(WEMUST_ROOT, { withFileTypes: true }); } catch { }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const state = await loadCourseState(path.join(WEMUST_ROOT, entry.name));
+    if (state.courseCode && state.courseCode.toUpperCase() === codeUpper) {
+      return { courseCode: state.courseCode, courseName: state.courseName, url: state.moodleUrl };
+    }
+  }
+  return null;
 }
 
 // Find an existing course dir whose .muster.json has a matching moodleUrl.
@@ -209,30 +212,6 @@ async function saveTimetableState(state) {
   const tmp = TIMETABLE_PATH + '.tmp';
   await fsp.writeFile(tmp, JSON.stringify(state, null, 2), 'utf8');
   await fsp.rename(tmp, TIMETABLE_PATH);
-}
-
-function weekBounds(dateStr) {
-  const d = new Date(dateStr + 'T12:00:00+08:00');
-  const dow = d.getDay() || 7; // 1=Mon … 7=Sun
-  const monday = new Date(d);
-  monday.setDate(d.getDate() - dow + 1);
-  const sunday = new Date(monday);
-  sunday.setDate(monday.getDate() + 6);
-  const fmt = x => x.toISOString().slice(0, 10);
-  return { mondayStr: fmt(monday), sundayStr: fmt(sunday) };
-}
-
-function weekKey(mondayStr, sundayStr) {
-  return `${mondayStr}_${sundayStr}`;
-}
-
-function isWeekStale(entry, mondayStr, sundayStr) {
-  if (!entry || !entry.fetchedAt) return true;
-  const todayStr = macauDateOffset(0);
-  if (sundayStr < todayStr) return false; // past week: immutable
-  const ageMs = Date.now() - new Date(entry.fetchedAt).getTime();
-  if (mondayStr <= todayStr) return ageMs > STALE_CURRENT_MS;
-  return ageMs > STALE_FUTURE_MS;
 }
 
 // Low-level: capture the timetable page's own API responses via a hooked XHR.
@@ -377,37 +356,7 @@ function isSemesterCovered(ttState, startDate, endDate) {
   return true;
 }
 
-function getLessonDatesForCourse(ttState, courseCode) {
-  const dates = new Set();
-  for (const entry of Object.values(ttState.weeks)) {
-    for (const l of (entry.lessons || [])) {
-      if (l.courseCode === courseCode) dates.add(l.lessonDate);
-    }
-  }
-  return [...dates].sort();
-}
-
 // ── File metadata helpers ─────────────────────────────────────────────────────
-
-function extractModId(resourceUrl) {
-  try {
-    const u = new URL(resourceUrl, MOODLE_URL);
-    if (u.pathname.includes('/mod/') && u.searchParams.has('id')) {
-      return Number(u.searchParams.get('id')) || null;
-    }
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-function unixToDate(unixSeconds) {
-  const d = new Date(unixSeconds * 1000);
-  const y = d.getUTCFullYear();
-  const m = String(d.getUTCMonth() + 1).padStart(2, '0');
-  const day = String(d.getUTCDate()).padStart(2, '0');
-  return `${y}-${m}-${day}`;
-}
 
 async function fetchModuleTimestamps(page, courseUrl, resourceLinks) {
   const modIds = [];
@@ -493,8 +442,11 @@ async function classifyAndDownload(state, candidate, courseDir, page, creds) {
 
   const existingEntry = state.files.find(e => e.filename === candidate.filename && e.fileUrl === candidate.normalizedFileUrl);
   if (existingEntry) {
-    // Same URL but size changed → updated
-    if (existingEntry.size !== candidate.size) {
+    // Same URL but size changed → updated. Only compare when both sizes are
+    // known: a HEAD-less server reports -1 and must not trigger a re-download.
+    const knownSizes = Number.isFinite(existingEntry.size) && existingEntry.size >= 0
+      && Number.isFinite(candidate.size) && candidate.size >= 0;
+    if (knownSizes && existingEntry.size !== candidate.size) {
       status = 'updated';
       const oldFilePath = path.join(courseDir, existingEntry.path);
       await fsp.unlink(oldFilePath).catch(() => {});
@@ -562,50 +514,6 @@ async function gotoAndAuth(page, url, creds) {
 
 // ── Moodle helpers ───────────────────────────────────────────────────────────
 
-function scoreCourseMatch(required, candidate) {
-  const a = required.toLowerCase();
-  const b = candidate.toLowerCase();
-  if (a === b) return 100;
-  if (b.includes(a)) return 80;
-  if (a.includes(b)) return 70;
-
-  const aTokens = new Set(a.split(/[^a-z0-9\u4e00-\u9fff]+/i).filter(Boolean));
-  const bTokens = new Set(b.split(/[^a-z0-9\u4e00-\u9fff]+/i).filter(Boolean));
-  let overlap = 0;
-  for (const t of aTokens) if (bTokens.has(t)) overlap += 1;
-  return overlap * 10;
-}
-
-function matchCourses(targetCourses, moodleCourses) {
-  const out = [];
-  for (const target of targetCourses) {
-    if (target.courseCode) {
-      const codeUpper = target.courseCode.toUpperCase();
-      const byCode = moodleCourses.find(
-        mc => mc.name.toUpperCase().includes(codeUpper) || mc.url.toUpperCase().includes(codeUpper)
-      );
-      if (byCode) {
-        out.push({ requestedName: target.name, courseCode: target.courseCode, ...byCode });
-        continue;
-      }
-    }
-    const candidates = [target.name, target.enName].filter(Boolean);
-    let best = null;
-    for (const name of candidates) {
-      const ranked = moodleCourses
-        .map((mc) => ({ course: mc, score: scoreCourseMatch(name, mc.name) }))
-        .sort((x, y) => y.score - x.score);
-      if (ranked.length && ranked[0].score >= 20) {
-        if (!best || ranked[0].score > best.score) best = ranked[0];
-      }
-    }
-    if (best) {
-      out.push({ requestedName: target.name, courseCode: target.courseCode, ...best.course });
-    }
-  }
-  return out;
-}
-
 async function listMoodleCourses(page, creds, termFilter) {
   await gotoAndAuth(page, new URL('/my/', MOODLE_URL).toString(), creds);
   await page.waitForLoadState('load').catch(() => {});
@@ -624,7 +532,9 @@ async function listMoodleCourses(page, creds, termFilter) {
   const seen = new Set();
   for (const { href, text } of rawLinks) {
     if (!href) continue;
-    const url = new URL(href, MOODLE_URL).toString();
+    const parsed = new URL(href, MOODLE_URL);
+    if (!isMoodleHost(parsed.hostname)) continue;
+    const url = parsed.toString();
     const name = normalizeText(text);
     if (!name) continue;
     const key = `${name}|${url}`;
@@ -649,29 +559,15 @@ async function listResourceLinks(page, courseUrl, creds) {
   const seen = new Set();
   for (const { href, text } of rawLinks) {
     if (!href) continue;
-    const url = new URL(href, MOODLE_URL).toString();
+    const parsed = new URL(href, MOODLE_URL);
+    if (!isMoodleHost(parsed.hostname)) continue;
+    const url = parsed.toString();
     if (seen.has(url)) continue;
     seen.add(url);
     const name = normalizeText(text);
     links.push({ url, name });
   }
   return links;
-}
-
-async function inferFileNameFromHeaders(response, fallbackUrl) {
-  const cd = response.headers()['content-disposition'] || '';
-  const utf = cd.match(/filename\*=UTF-8''([^;]+)/i);
-  if (utf && utf[1]) return decodeURIComponent(utf[1]);
-  const plain = cd.match(/filename="?([^";]+)"?/i);
-  if (plain && plain[1]) return plain[1];
-
-  try {
-    const u = new URL(fallbackUrl);
-    const basename = path.basename(u.pathname);
-    return basename || 'download.bin';
-  } catch {
-    return 'download.bin';
-  }
 }
 
 async function probeFileMetadata(context, fileUrl, fallbackName) {
@@ -697,8 +593,7 @@ async function probeFileMetadata(context, fileUrl, fallbackName) {
   }
 
   const finalUrl = response.url();
-  const sizeHeader = response.headers()['content-length'];
-  const size = Number.isFinite(Number(sizeHeader)) ? Number(sizeHeader) : -1;
+  const size = responseContentLength(response);
   const guessed = await inferFileNameFromHeaders(response, finalUrl || fileUrl);
   const filename = safeFilename(fallbackName || guessed);
   return {
@@ -723,7 +618,9 @@ async function collectFilesFromResource(page, context, resourceUrl, creds, optio
     const hrefRaw = await anchor.getAttribute('href');
     if (!hrefRaw) continue;
 
-    const fileUrl = new URL(hrefRaw, MOODLE_URL).toString();
+    const parsedFileUrl = new URL(hrefRaw, MOODLE_URL);
+    if (!isMoodleHost(parsedFileUrl.hostname)) continue;
+    const fileUrl = parsedFileUrl.toString();
     const textName = normalizeText(await anchor.innerText().catch(() => ''));
     const hintName = fileExtRe.test(textName) ? textName : undefined;
 
@@ -757,7 +654,9 @@ async function collectFilesFromFolder(page, context, folderUrl, creds, subDir, o
   for (const { href: hrefRaw, text } of fileLinks) {
     if (!hrefRaw) continue;
 
-    const fileUrl = new URL(hrefRaw, MOODLE_URL).toString();
+    const parsedFileUrl = new URL(hrefRaw, MOODLE_URL);
+    if (!isMoodleHost(parsedFileUrl.hostname)) continue;
+    const fileUrl = parsedFileUrl.toString();
     const textName = normalizeText(text);
     const hintName = fileExtRe.test(textName) ? textName : undefined;
 
@@ -820,7 +719,9 @@ async function collectFilesFromAssign(page, context, assignUrl, creds, subDir, o
     const hrefRaw = await anchor.getAttribute('href');
     if (!hrefRaw) continue;
 
-    const fileUrl = new URL(hrefRaw, MOODLE_URL).toString();
+    const parsedFileUrl = new URL(hrefRaw, MOODLE_URL);
+    if (!isMoodleHost(parsedFileUrl.hostname)) continue;
+    const fileUrl = parsedFileUrl.toString();
     const textName = normalizeText(await anchor.innerText().catch(() => ''));
     const hintName = fileExtRe.test(textName) ? textName : undefined;
 
@@ -839,124 +740,6 @@ async function collectFilesFromAssign(page, context, assignUrl, creds, subDir, o
 
 // ── Announcements (forum) + external link (Dropbox etc.) collectors ─────────
 
-const EXTERNAL_LINK_HOST_RE = /(dropbox\.com|drive\.google\.com|onedrive\.live\.com|1drv\.ms|mega\.nz|we\.tl)$/i;
-
-function dropboxDirectUrl(url) {
-  try {
-    const u = new URL(url);
-    if (u.hostname === 'www.dropbox.com' || u.hostname === 'dropbox.com') {
-      if (u.searchParams.get('dl') === '0' || !u.searchParams.has('dl')) {
-        u.searchParams.set('dl', '1');
-      }
-    }
-    return u.toString();
-  } catch {
-    return url;
-  }
-}
-
-// DNS resolver that bypasses the OS resolver (mDNSResponder can stall on some
-// CDN names like dropbox.com on campus networks). Uses direct DNS queries and
-// supports Node's happy-eyeballs lookup (opts.all → return address array).
-function resolve4WithTimeout(hostname, ms = 8000) {
-  return new Promise((resolve, reject) => {
-    const r = new dns.Resolver();
-    const timer = setTimeout(() => {
-      r.cancel();
-      reject(new Error(`DNS timeout for ${hostname}`));
-    }, ms);
-    r.resolve4(hostname, (err, addrs) => {
-      clearTimeout(timer);
-      if (err) reject(err);
-      else resolve(addrs);
-    });
-  });
-}
-
-function dnsResolver() {
-  const cache = new Map();
-  return (hostname, opts, cb) => {
-    const wantAll = !!(opts && opts.all);
-    const done = (err, addrs) => {
-      if (err) { cb(err); return; }
-      if (wantAll) cb(null, addrs);
-      else if (addrs && addrs.length) cb(null, addrs[0].address, addrs[0].family);
-      else cb(new Error(`no address for ${hostname}`));
-    };
-    if (cache.has(hostname)) {
-      process.nextTick(() => done(null, cache.get(hostname)));
-      return;
-    }
-    resolve4WithTimeout(hostname).then((ips) => {
-      const addrs = ips.map((ip) => ({ address: ip, family: 4 }));
-      cache.set(hostname, addrs);
-      done(null, addrs);
-    }).catch((err) => {
-      const e = new Error(`DNS resolve failed for ${hostname}: ${err && (err.code || err.message)}`);
-      e.code = err && err.code;
-      cb(e);
-    });
-  };
-}
-
-function httpGetExternal(url, redirectsLeft = 5) {
-  return new Promise((resolve, reject) => {
-    let target;
-    try {
-      target = new URL(url);
-    } catch (e) {
-      reject(e);
-      return;
-    }
-    const lib = target.protocol === 'https:' ? https : http;
-    const req = lib.get(target, {
-      lookup: dnsResolver(),
-      headers: { 'User-Agent': 'must-bee/1.0 (courseware sync)' }
-    }, (res) => {
-      const status = res.statusCode || 0;
-      if (status >= 300 && status < 400 && res.headers.location && redirectsLeft > 0) {
-        res.resume();
-        const next = new URL(res.headers.location, target).toString();
-        resolve(httpGetExternal(next, redirectsLeft - 1));
-        return;
-      }
-      if (status !== 200) {
-        res.resume();
-        reject(new Error(`HTTP ${status} for ${target.hostname}${target.pathname}`));
-        return;
-      }
-      const chunks = [];
-      res.on('data', (c) => chunks.push(c));
-      res.on('end', () => resolve({ url: target.toString(), buffer: Buffer.concat(chunks), headers: res.headers }));
-    });
-    req.on('error', reject);
-    req.setTimeout(120000, () => req.destroy(new Error('download timeout')));
-  });
-}
-
-function isZipBuffer(buffer) {
-  return buffer.length > 4 && buffer[0] === 0x50 && buffer[1] === 0x4b;
-}
-
-function extractZipFiles(buffer) {
-  // Extract PDF/PPT/PPTX entries from a zip archive (e.g. a shared Dropbox
-  // folder downloaded as zip). Returns { isZip, files: [{filename, buffer}] }.
-  if (!isZipBuffer(buffer)) return { isZip: false, files: [] };
-  const out = [];
-  try {
-    const zip = new AdmZip(buffer);
-    for (const entry of zip.getEntries()) {
-      if (entry.isDirectory) continue;
-      const name = safeFilename(path.basename(entry.entryName));
-      if (!FILE_EXT_RE.test(name)) continue;
-      out.push({ filename: name, buffer: entry.getData() });
-    }
-    return { isZip: true, files: out };
-  } catch {
-    return { isZip: true, files: [] };
-  }
-}
-
 async function listForumLinks(page, courseUrl, creds) {
   await gotoAndAuth(page, courseUrl, creds);
   await page.waitForLoadState('load').catch(() => {});
@@ -973,7 +756,9 @@ async function listForumLinks(page, courseUrl, creds) {
   const seen = new Set();
   const out = [];
   for (const { href, text } of rawLinks) {
-    const url = new URL(href, MOODLE_URL).toString();
+    const parsed = new URL(href, MOODLE_URL);
+    if (!isMoodleHost(parsed.hostname)) continue;
+    const url = parsed.toString();
     if (seen.has(url)) continue;
     seen.add(url);
     out.push({ url, name: normalizeText(text) || 'Announcements' });
@@ -988,7 +773,7 @@ async function collectForumAttachments(page, context, forumUrl, creds, options =
   const maxPosts = options.maxPosts || 10;
   await gotoAndAuth(page, forumUrl, creds);
 
-  const postLinks = await page.evaluate(() => {
+  const postLinks = (await page.evaluate(() => {
     const seen = new Set();
     const out = [];
     for (const a of document.querySelectorAll('a[href*="/mod/forum/discuss.php"]')) {
@@ -1004,24 +789,28 @@ async function collectForumAttachments(page, context, forumUrl, creds, options =
       } catch { /* skip malformed */ }
     }
     return out;
+  })).filter((post) => {
+    try { return isMoodleHost(new URL(post.url).hostname); } catch { return false; }
   });
 
   const posts = [];
   const candidates = [];
   for (const post of postLinks.slice(0, maxPosts)) {
     await gotoAndAuth(page, post.url, creds);
-    const postInfo = await page.evaluate(() => {
+    const postInfo = await page.evaluate((externalHosts) => {
       const contentEl = document.querySelector('.post-content-container, .no-overflow, [data-region="post-content"]') || document.body;
       const pluginfiles = Array.from(contentEl.querySelectorAll('a[href*="pluginfile.php"]'))
         .map(a => a.getAttribute('href')).filter(Boolean);
-      const hostRe = /(dropbox\.com|drive\.google\.com|onedrive\.live\.com|1drv\.ms|mega\.nz|we\.tl)$/i;
+      const isExternalHost = (host) => externalHosts.some(
+        (domain) => host === domain || host.endsWith('.' + domain)
+      );
       const externals = [];
       const seen = new Set();
       const pushExt = (href) => {
         if (!href) return;
         try {
-          const host = new URL(href).hostname;
-          if (!hostRe.test(host)) return;
+          const host = new URL(href).hostname.toLowerCase();
+          if (!isExternalHost(host)) return;
           if (seen.has(href)) return;
           seen.add(href);
           externals.push(href);
@@ -1039,10 +828,17 @@ async function collectForumAttachments(page, context, forumUrl, creds, options =
       const raw = timeEl && (timeEl.getAttribute('datetime') || timeEl.getAttribute('data-timestamp'));
       if (raw) {
         const d = /^\d+$/.test(raw) ? new Date(Number(raw) * 1000) : new Date(raw);
-        if (!isNaN(d.getTime())) dateStr = d.toISOString().slice(0, 10);
+        if (!isNaN(d.getTime())) {
+          const parts = new Intl.DateTimeFormat('en-CA', {
+            timeZone: 'Asia/Macau', year: 'numeric', month: '2-digit', day: '2-digit'
+          }).formatToParts(d);
+          dateStr = `${parts.find(p => p.type === 'year').value}-`
+            + `${parts.find(p => p.type === 'month').value}-`
+            + `${parts.find(p => p.type === 'day').value}`;
+        }
       }
       return { pluginfiles, external: externals, dateStr };
-    });
+    }, EXTERNAL_FILE_HOSTS);
 
     const uploadDate = postInfo.dateStr || macauDateOffset(0);
     posts.push({
@@ -1061,6 +857,12 @@ async function collectForumAttachments(page, context, forumUrl, creds, options =
 
     if (options.skipExternalDownload) continue;
     for (const href of postInfo.external) {
+      // Re-check the host at fetch time (the page-side filter is best-effort).
+      try {
+        if (!isExternalFileHost(new URL(href).hostname)) continue;
+      } catch {
+        continue;
+      }
       const direct = dropboxDirectUrl(href);
       try {
         const resp = await httpGetExternal(direct);
@@ -1139,8 +941,19 @@ async function downloadCandidate(page, candidate, outputDir, creds) {
       }
     })();
 
-    const relink = page.locator(`a[href*="${filePath.replace(/"/g, '')}"]`).first();
-    if ((await relink.count()) === 0) {
+    // Find the link by reading hrefs instead of interpolating the URL into a
+    // CSS selector (a path containing quotes/brackets would break the selector).
+    const anchors = page.locator('a[href]');
+    const anchorCount = await anchors.count();
+    let relink = null;
+    for (let i = 0; i < anchorCount; i += 1) {
+      const href = await anchors.nth(i).getAttribute('href').catch(() => null);
+      if (href && href.includes(filePath)) {
+        relink = anchors.nth(i);
+        break;
+      }
+    }
+    if (!relink) {
       throw new Error('download link not found on resource page');
     }
 
@@ -1161,7 +974,8 @@ async function runSyncForCourse(course, page, context, creds, report, options = 
   const defaultDir = path.join(WEMUST_ROOT, courseDirName(course.courseCode || '', course.requestedName || course.name));
   const courseDir = (await findExistingCourseDirByUrl(course.url)) || defaultDir;
   const state = await loadCourseState(courseDir);
-  state.courseCode = course.courseCode || state.courseCode;
+  state.courseCode = course.courseCode || state.courseCode
+    || deriveCourseCode(course.requestedName || course.name);
   state.courseName = course.requestedName || course.name;
   state.moodleUrl = course.url;
 
@@ -1287,10 +1101,16 @@ function makeSyncReport(scope) {
 }
 
 function launchBrowser() {
+  // Keep Chromium's sandbox on by default. It is disabled only when the user
+  // explicitly opts out (e.g. running as root in a container, where Chromium
+  // refuses to start with a sandbox).
+  const noSandbox = process.env.MUSTER_NO_SANDBOX === '1';
   return chromium.launch({
     headless: true,
-    chromiumSandbox: false,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+    chromiumSandbox: !noSandbox,
+    ...(noSandbox
+      ? { args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] }
+      : {})
   });
 }
 
@@ -1321,9 +1141,11 @@ async function cmdSync(options) {
         if (tt.termCode) termFilter = String(tt.termCode) + '-';
       } catch { /* no cache */ }
 
+      // Fetch once: filtered by the cached term when available, otherwise all
+      // courses so the term can be inferred from their names.
+      const courses = await listMoodleCourses(page, creds, termFilter);
       if (!termFilter) {
-        const allCourses = await listMoodleCourses(page, creds, null);
-        const termCodes = allCourses
+        const termCodes = courses
           .map(c => c.name.match(/^(\d{4})-/))
           .filter(Boolean)
           .map(m => m[1]);
@@ -1331,19 +1153,12 @@ async function cmdSync(options) {
           termFilter = termCodes.sort().at(-1) + '-';
           dbg(`auto-detected termCode=${termFilter}`);
         }
-        const filtered = termFilter
-          ? allCourses.filter(c => c.name.startsWith(termFilter))
-          : allCourses;
-        report.matchedCourses = filtered;
-        for (const course of filtered) {
-          await runSyncForCourse(course, page, context, creds, report);
-        }
-        return report;
       }
-
-      const moodleCourses = await listMoodleCourses(page, creds, termFilter);
-      report.matchedCourses = moodleCourses;
-      for (const course of moodleCourses) {
+      const filtered = termFilter
+        ? courses.filter(c => c.name.startsWith(termFilter))
+        : courses;
+      report.matchedCourses = filtered;
+      for (const course of filtered) {
         await runSyncForCourse(course, page, context, creds, report);
       }
       return report;
@@ -1573,7 +1388,8 @@ async function cmdFiles(options) {
 
   // --recent: most recently synced files across all courses
   if ('recent' in options) {
-    const n = options.n ? Number(options.n) : 10;
+    const parsed = Number.parseInt(options.n, 10);
+    const n = Number.isFinite(parsed) && parsed > 0 ? Math.min(parsed, 1000) : 10;
     const all = [];
     for (const entry of entries) {
       if (!entry.isDirectory()) continue;
@@ -1610,13 +1426,13 @@ async function cmdFiles(options) {
     }
     if (!state) return { fromCache: false, prevDate: null, files: [] };
 
-    const creds = ensureCredentials();
     const LOOKBACK_DAYS = [28, 56, 84];
     const target = new Date(targetDate + 'T12:00:00+08:00');
     const ttState = await loadTimetableState();
     let prevDate = null;
     let fromCache = true;
     let rightEdge = targetDate;
+    let creds = null;
 
     let browser, context, page;
     try {
@@ -1628,6 +1444,7 @@ async function cmdFiles(options) {
         if (!isSemesterCovered(ttState, windowStartStr, rightEdge)) {
           fromCache = false;
           if (!browser) {
+            creds = ensureCredentials();
             browser = await launchBrowser();
             context = await browser.newContext();
             await installCapture(context);
@@ -1766,17 +1583,7 @@ async function cmdCourse(options) {
   const codeUpper = String(options.code).toUpperCase();
 
   // Resolve course URL from cache; fall back to a live Moodle dashboard scan
-  let entries = [];
-  try { entries = await fsp.readdir(WEMUST_ROOT, { withFileTypes: true }); } catch { }
-  let target = null;
-  for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
-    const state = await loadCourseState(path.join(WEMUST_ROOT, entry.name));
-    if (state.courseCode && state.courseCode.toUpperCase() === codeUpper) {
-      target = { courseCode: state.courseCode, courseName: state.courseName, url: state.moodleUrl };
-      break;
-    }
-  }
+  let target = await findCachedCourseByCode(codeUpper);
 
   const creds = ensureCredentials();
   let browser, context, page;
@@ -1861,7 +1668,7 @@ async function cmdCourse(options) {
 
 async function cmdAssign(options) {
   const creds = ensureCredentials();
-  let assignUrl = options.url ? String(options.url) : null;
+  let assignUrl = options.url ? requireMoodleUrl(options.url, 'assign --url') : null;
   let courseOut = null;
 
   let browser, context, page;
@@ -1875,17 +1682,7 @@ async function cmdAssign(options) {
       if (!options.code) throw new Error('assign requires --url <url> or --code COURSECODE');
       const codeUpper = String(options.code).toUpperCase();
 
-      let entries = [];
-      try { entries = await fsp.readdir(WEMUST_ROOT, { withFileTypes: true }); } catch { }
-      let target = null;
-      for (const entry of entries) {
-        if (!entry.isDirectory()) continue;
-        const state = await loadCourseState(path.join(WEMUST_ROOT, entry.name));
-        if (state.courseCode && state.courseCode.toUpperCase() === codeUpper) {
-          target = { courseCode: state.courseCode, courseName: state.courseName, url: state.moodleUrl };
-          break;
-        }
-      }
+      let target = await findCachedCourseByCode(codeUpper);
       if (!target) throw new Error(`Course '${options.code}' not found in cache. Run 'sync' first or use --url.`);
 
       const resourceLinks = await listResourceLinks(page, target.url, creds);
@@ -1987,7 +1784,7 @@ async function cmdAssign(options) {
 
 async function cmdPost(options) {
   const creds = ensureCredentials();
-  let postUrl = options.url ? String(options.url) : null;
+  let postUrl = options.url ? requireMoodleUrl(options.url, 'post --url') : null;
 
   let browser, context, page;
   try {
@@ -1999,17 +1796,7 @@ async function cmdPost(options) {
       if (!options.code) throw new Error('post requires --url <url> or --code COURSECODE [--name TEXT]');
       const codeUpper = String(options.code).toUpperCase();
 
-      let entries = [];
-      try { entries = await fsp.readdir(WEMUST_ROOT, { withFileTypes: true }); } catch { }
-      let target = null;
-      for (const entry of entries) {
-        if (!entry.isDirectory()) continue;
-        const state = await loadCourseState(path.join(WEMUST_ROOT, entry.name));
-        if (state.courseCode && state.courseCode.toUpperCase() === codeUpper) {
-          target = { courseCode: state.courseCode, courseName: state.courseName, url: state.moodleUrl };
-          break;
-        }
-      }
+      let target = await findCachedCourseByCode(codeUpper);
       if (!target) throw new Error(`Course '${options.code}' not found in cache. Run 'sync' first or use --url.`);
 
       const forums = await listForumLinks(page, target.url, creds);
@@ -2021,6 +1808,11 @@ async function cmdPost(options) {
           .map(a => ({ url: a.href, title: (a.textContent || '').replace(/\s+/g, ' ').trim() })));
         for (const item of found) {
           if (seen.has(item.url)) continue;
+          try {
+            if (!isMoodleHost(new URL(item.url).hostname)) continue;
+          } catch {
+            continue;
+          }
           seen.add(item.url);
           links.push(item);
         }
@@ -2090,22 +1882,12 @@ async function cmdForum(options) {
   let courseInfo = null;
 
   if (options.url) {
-    forumUrls = [{ url: String(options.url), name: null }];
+    forumUrls = [{ url: requireMoodleUrl(options.url, 'forum --url'), name: null }];
   } else {
     if (!options.code) throw new Error('forum requires --code COURSECODE or --url <forum url>');
     const codeUpper = String(options.code).toUpperCase();
 
-    let entries = [];
-    try { entries = await fsp.readdir(WEMUST_ROOT, { withFileTypes: true }); } catch { }
-    let target = null;
-    for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
-      const state = await loadCourseState(path.join(WEMUST_ROOT, entry.name));
-      if (state.courseCode && state.courseCode.toUpperCase() === codeUpper) {
-        target = { courseCode: state.courseCode, courseName: state.courseName, url: state.moodleUrl };
-        break;
-      }
-    }
+    let target = await findCachedCourseByCode(codeUpper);
     courseInfo = target;
     if (!target) {
       // fall back to the live dashboard scan
@@ -2149,7 +1931,7 @@ async function cmdForum(options) {
       await page.waitForLoadState('load').catch(() => {});
       await page.waitForTimeout(800);
 
-      const threads = await page.evaluate(() => {
+      const threads = (await page.evaluate(() => {
         const seen = new Set();
         const out = [];
         for (const a of document.querySelectorAll('a[href*="/mod/forum/discuss.php"]')) {
@@ -2164,10 +1946,12 @@ async function cmdForum(options) {
           } catch { /* skip */ }
         }
         return out;
+      })).filter((thread) => {
+        try { return isMoodleHost(new URL(thread.url).hostname); } catch { return false; }
       });
 
       // A forum index page (mod/forum/index.php) lists sub-forums instead of threads
-      const subForums = await page.evaluate(() => {
+      const subForums = (await page.evaluate(() => {
         const seen = new Set();
         const out = [];
         for (const a of document.querySelectorAll('a[href*="/mod/forum/view.php"]')) {
@@ -2181,6 +1965,8 @@ async function cmdForum(options) {
           } catch { /* skip */ }
         }
         return out;
+      })).filter((forum) => {
+        try { return isMoodleHost(new URL(forum.url).hostname); } catch { return false; }
       });
 
       const posts = [];
@@ -2245,17 +2031,7 @@ async function cmdLinks(options) {
   const codeUpper = String(options.code).toUpperCase();
   const creds = ensureCredentials();
 
-  let entries = [];
-  try { entries = await fsp.readdir(WEMUST_ROOT, { withFileTypes: true }); } catch { }
-  let target = null;
-  for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
-    const state = await loadCourseState(path.join(WEMUST_ROOT, entry.name));
-    if (state.courseCode && state.courseCode.toUpperCase() === codeUpper) {
-      target = { courseCode: state.courseCode, courseName: state.courseName, url: state.moodleUrl };
-      break;
-    }
-  }
+  let target = await findCachedCourseByCode(codeUpper);
 
   let browser, context, page;
   try {
@@ -2303,8 +2079,9 @@ async function cmdLinks(options) {
 
 async function cmdGet(options) {
   if (!options.url) throw new Error('get requires --url <file URL>');
-  const fileUrl = String(options.url);
-  const outDir = options.out ? String(options.out) : path.join(DOWNLOAD_ROOT, '_inbox');
+  const fileUrl = requireMoodleUrl(options.url, 'get --url');
+
+  const outDir = options.out ? path.resolve(String(options.out)) : path.join(DOWNLOAD_ROOT, '_inbox');
   await fsp.mkdir(outDir, { recursive: true });
 
   const creds = ensureCredentials();
@@ -2321,7 +2098,7 @@ async function cmdGet(options) {
       page.goto(fileUrl, { waitUntil: 'commit', timeout: 60000 }).catch(() => {})
     ]);
     const name = safeFilename(download.suggestedFilename() || path.basename(new URL(fileUrl).pathname) || 'download.bin');
-    const dest = path.join(outDir, name);
+    const dest = await ensureUniquePath(path.join(outDir, name));
     await download.saveAs(dest);
     const stat = await fsp.stat(dest).catch(() => null);
     return { url: fileUrl, saved: dest, bytes: stat ? stat.size : null };
@@ -2352,10 +2129,20 @@ async function cmdNotes(options) {
   if ('force' in options) args.push('--force');
   if (options.limit) args.push('--limit', String(options.limit));
 
+  // Do not hand the whole environment to the Python child: MUSTER_PASSWORD
+  // has no business being there. Pass only what notes.py actually needs.
+  const childEnv = {};
+  for (const key of ['PATH', 'HOME', 'LANG', 'LC_ALL', 'TMPDIR', 'PYTHONPATH']) {
+    if (process.env[key] !== undefined) childEnv[key] = process.env[key];
+  }
+  for (const key of ['DEEPSEEK_API_KEY', 'DEEPSEEK_MODEL', 'OBSIDIAN_VAULT_PATH', 'MUSTER_DOWNLOAD_PATH', 'MUST_BEE_ENV']) {
+    if (process.env[key] !== undefined) childEnv[key] = process.env[key];
+  }
+
   return new Promise((resolve, reject) => {
-    const child = spawn('python3', args, {
+    const child = spawn(process.env.MUSTER_PYTHON || 'python3', args, {
       cwd: path.join(__dirname, '..'),
-      env: process.env,
+      env: childEnv,
       stdio: ['ignore', 'pipe', 'pipe']
     });
     let stdout = '';
@@ -2431,19 +2218,6 @@ async function cmdStatus() {
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
-function parseCli(argv) {
-  const [cmd, ...rest] = argv;
-  const options = {};
-  for (let i = 0; i < rest.length; i += 1) {
-    const token = rest[i];
-    if (!token.startsWith('--')) continue;
-    const key = token.slice(2);
-    const value = rest[i + 1] && !rest[i + 1].startsWith('--') ? rest[++i] : true;
-    options[key] = value;
-  }
-  return { cmd, options };
-}
-
 function printUsage() {
   console.log(`Usage:
   node scripts/muster_cli.js sync [--week [YYYY-MM-DD]] [--all]
@@ -2452,6 +2226,9 @@ function printUsage() {
   node scripts/muster_cli.js course --code COURSECODE
   node scripts/muster_cli.js assign --url URL | --code COURSECODE [--name TEXT]
   node scripts/muster_cli.js post --url URL | --code COURSECODE [--name TEXT]
+  node scripts/muster_cli.js forum --url URL | --code COURSECODE [--bodies]
+  node scripts/muster_cli.js links --code COURSECODE
+  node scripts/muster_cli.js get --url URL [--out DIR]
   node scripts/muster_cli.js pending [--course COURSECODE]
   node scripts/muster_cli.js files [--course COURSECODE] [--date YYYY-MM-DD] [--recent [--n N]]
   node scripts/muster_cli.js notes [--course COURSECODE] [--dry-run] [--force] [--limit N]
@@ -2489,6 +2266,11 @@ async function main() {
   const { cmd, options } = parseCli(process.argv.slice(2));
   if (options.debug) DEBUG = true;
 
+  if (cmd === '--version' || cmd === '-v' || options.version) {
+    console.log(pkg.version);
+    return;
+  }
+
   if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') {
     printUsage();
     process.exit(0);
@@ -2513,10 +2295,16 @@ async function main() {
   console.log(JSON.stringify(result, null, 2));
 }
 
-main().catch((err) => {
-  const out = err.partialReport
-    ? { error: String(err.message || err), partialReport: err.partialReport }
-    : { error: String(err.message || err) };
-  console.error(JSON.stringify(out, null, 2));
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((err) => {
+    const out = err.partialReport
+      ? { error: String(err.message || err), partialReport: err.partialReport }
+      : { error: String(err.message || err) };
+    console.error(JSON.stringify(out, null, 2));
+    process.exit(1);
+  });
+}
+
+module.exports = {
+  launchBrowser
+};

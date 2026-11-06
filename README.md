@@ -1,6 +1,6 @@
 # must-bee 🐝
 
-must-bee plugs wemust / Moodle straight into your Agent. Every command emits structured JSON, so any tool-using agent can drive it.
+**M.U.S.T. Moodle + timetable, as JSON your agent can drive.**
 
 > *"Did the lecturer upload new slides again?"*
 > *"Which assignment is due tomorrow, again?"*
@@ -10,32 +10,50 @@ must-bee plugs wemust / Moodle straight into your Agent. Every command emits str
 
 **Languages:** [English](./README.md) · [中文](./README_CN.md)
 
+[![CI](https://github.com/Frankynwa/must-bee/actions/workflows/ci.yml/badge.svg)](https://github.com/Frankynwa/must-bee/actions/workflows/ci.yml)
+
 ---
 
-## Things you can finally just ask your agent
+> [!WARNING]
+> **Unofficial project.** must-bee is not affiliated with or endorsed by Macau
+> University of Science and Technology. It automates a student's own Moodle and
+> timetable sessions. Automated access may violate your university's acceptable
+> use policy — check before using it, and use it at your own risk.
 
-> 🗣️ **"What classes do I have tonight? Which room?"**
-> No wemust, no login.
+## What it does
 
-> 🗣️ **"Sync this week's timetable to my calendar."**
-> Agent pulls your schedule via MUSTer, hands it to your calendar tool. One sentence, a week booked.
+must-bee logs into the M.U.S.T. CAS portal with Playwright, then exposes Moodle
+and the class timetable as a small CLI where **every command prints one JSON
+value to stdout**. Any tool-using agent (Claude Code, Hermes, Codex, a custom
+script) can drive it without parsing HTML.
 
-> 🗣️ **"What do I need to read before CS101 tomorrow?"**
-> Agent lists every PPT / PDF the lecturer uploaded since last class — files and paths ready to open.
+- 🔄 **Incremental sync** — only downloads new or changed courseware
+- 📅 **Timetable** — today, a specific date, or a whole week
+- 📚 **Courses & materials** — every enrolled course, assignment, quiz and file
+- 📝 **Deadlines** — upcoming Moodle calendar events
+- 📄 **Assignments** — description, submission status and attachments
+- 📢 **Announcements** — forum post bodies, including exam notices
+- 🔗 **External courseware** — Dropbox / Google Drive / OneDrive / MEGA / WeTransfer links in announcements
+- 🧠 **Obsidian notes** — optional: turn PDF/PPTX courseware into review notes with DeepSeek
+- 🧱 **JSON-first** — stable output shapes for agents
 
-> 🗣️ **"What's due this week? Which day is the worst?"**
-> Agent checks your assignment deadlines and warns you before the crunch hits.
+## Quick start
 
-## Features
+```bash
+git clone https://github.com/Frankynwa/must-bee.git
+cd must-bee
+npm install
+npx playwright install chromium
 
-- 🔄 **Incremental sync** — only downloads what's new or changed
-- 📅 **Timetable query** — today / specific date / whole week
-- 📚 **Course list & detail** — all enrolled courses + per-course assignments / quizzes / materials
-- 📝 **Pending assignments** — upcoming Moodle events, filterable by course
-- 📂 **File search** — by course, by class session, or N most recent
-- 🧱 **JSON-first** — every command emits structured JSON, agent-friendly
+cp .env.example .env
+# edit .env: MUSTER_USERNAME / MUSTER_PASSWORD
 
-## Let your Agent install it — just paste this
+set -a && . ./.env && set +a
+node scripts/muster_cli.js sync --all   # first full sync
+node scripts/muster_cli.js schedule     # today's classes
+```
+
+Or install it as a skill — paste this into your agent:
 
 ````text
 Please install the must-bee skill for me: https://github.com/Frankynwa/must-bee
@@ -43,105 +61,104 @@ Please install the must-bee skill for me: https://github.com/Frankynwa/must-bee
 Follow this workflow:
 1. Clone the repo into your skills directory
 2. cd in and run `npm install && npx playwright install chromium`
-3. Ask me for my MUSTer credentials (**do not invent them**), then export them as MUSTER_USERNAME / MUSTER_PASSWORD
+3. Ask me for my MUSTer credentials (do not invent them), then put them in .env as
+   MUSTER_USERNAME / MUSTER_PASSWORD
 4. Run `node scripts/muster_cli.js status` to verify it works
 5. Tell me how I can start using it
 ````
 
-The agent will read `SKILL.md` and the README in the repo, then walk through the steps above — clone, install deps, verify. Once it's done, you can ask about your timetable, assignments, and course materials directly.
-
-## Quick Start
-
-```bash
-# 1. Install
-npm install
-npx playwright install chromium
-
-# 2. Set credentials
-export MUSTER_USERNAME='your-id'
-export MUSTER_PASSWORD='your-password'
-
-# 3. First-time full sync, then query
-node scripts/muster_cli.js sync --all
-node scripts/muster_cli.js schedule
-```
-
 ## Commands
 
-| Command | What it does | Example |
-|---|---|---|
-| `sync` | Incremental download (current week by default) — *online* | `sync --week` / `sync --all` |
-| `schedule` | Timetable — *cache; fetches if range not yet cached* | `schedule --date 2026-03-13` |
-| `courses` | List enrolled courses — *cache; auto-syncs on first run* | `courses` |
-| `course` | Single-course detail — *online* | `course --code CS101` |
-| `assign` | One assignment page: description / submission status / attachments — *online* | `assign --code CS101 [--name LAB3]`, or `assign --url <url>` |
-| `pending` | Upcoming assignments — *online* | `pending --course CS101` |
-| `files` | Query downloaded materials — *cache; `--course --date` may fetch* | `files --course CS101 --date 2026-03-13` |
-| `status` | Sync state overview — *cache* | `status` |
+All commands are `node scripts/muster_cli.js <command>`. Add `--debug` to any
+command for `[debug]` traces on stderr.
 
-> `files --course CODE --date DATE` returns files uploaded between the previous class session and the target date — perfect for prepping a specific lecture.
->
-> Add `--debug` to any command to stream `[debug]` traces to stderr.
+| Command | What it does | Network |
+|---|---|---|
+| `sync [--week [DATE]] [--all]` | Incremental courseware sync (current week by default; `--all` = whole term) | online |
+| `schedule [--date DATE] [--week [DATE]]` | Timetable for a day / week | cache, fetches when needed |
+| `courses [--live]` | Enrolled courses (auto-syncs once if cache is empty) | cache, or live with `--live` |
+| `course --code CODE` | One course: assignments, quizzes, materials, announcements | online |
+| `assign --url URL` / `--code CODE [--name TEXT]` | One assignment: description, status, attachments | online |
+| `post --url URL` / `--code CODE [--name TEXT]` | One announcement's full body | online |
+| `forum --url URL` / `--code CODE [--bodies]` | Every thread in every forum (optionally with bodies) | online |
+| `links --code CODE` | Every activity/resource link in a course | online |
+| `get --url URL [--out DIR]` | Download one Moodle file through the logged-in session | online |
+| `pending [--course CODE]` | Upcoming Moodle deadlines | online |
+| `files [--course CODE] [--date DATE] [--recent [--n N]]` | Query downloaded files | cache |
+| `notes [--course CODE] [--dry-run] [--force] [--limit N]` | Generate Obsidian review notes | online (LLM) |
+| `status` | Sync state overview | cache |
+| `--version`, `--help` | Version / usage | — |
+
+`files --course CODE --date DATE` returns files uploaded between the previous
+class and `DATE` — useful for prepping one specific lecture.
 
 ## Configuration
 
-| Env Var | Required | Default | Description |
+| Variable | Required | Default | Description |
 |---|---|---|---|
-| `MUSTER_USERNAME` | ✅ | — | M.U.S.T. portal username |
-| `MUSTER_PASSWORD` | ✅ | — | M.U.S.T. portal password |
-| `MUSTER_DOWNLOAD_PATH` | optional | `~/Documents/wemust` | Where to store downloaded files and state |
+| `MUSTER_USERNAME` | yes* | — | M.U.S.T. portal username |
+| `MUSTER_PASSWORD` | yes* | — | M.U.S.T. portal password |
+| `MUSTER_DOWNLOAD_PATH` | no | `~/.must-bee` | Download/state root (files land in `<root>/wemust/`) |
+| `MUSTER_NO_SANDBOX` | no | `0` | Set to `1` only if Chromium cannot start with its sandbox (e.g. root in a container) |
+| `MUSTER_MAX_DOWNLOAD_MB` | no | `200` | Per-file cap for external announcement links |
+| `MUSTER_PYTHON` | no | `python3` | Python used by `notes` |
+| `DEEPSEEK_API_KEY` | for `notes` | — | API key for note generation |
+| `DEEPSEEK_API_BASE` | no | `https://api.deepseek.com` | Any DeepSeek-compatible endpoint |
+| `DEEPSEEK_MODEL` | no | `deepseek-chat` | Model used for notes |
+| `OBSIDIAN_VAULT_PATH` | for `notes` | first existing of `~/Vaults/Obsidian`, `~/Obsidian` | Vault root; notes go to `Courses/<course> <code>/` |
+| `MUST_BEE_ENV` | no | — | Extra `.env` file to load in `notes` |
+
+\* Cache-only commands (`status`, `files` without `--date`) work without
+credentials. Everything that talks to Moodle needs them.
+
+`notes` also needs Python packages:
+
+```bash
+python3 -m pip install -r requirements-notes.txt
+```
+
+## Security & privacy
+
+- **Credentials stay local.** They are read from the environment (or `.env`) and
+  typed into the M.U.S.T. login page only. must-bee has no telemetry, no remote
+  logging, and never writes credentials to disk. `.env` is gitignored.
+- **Chromium sandbox is on by default.** `MUSTER_NO_SANDBOX=1` is an explicit
+  opt-out for environments where the sandbox cannot work.
+- **Bounded downloads.** External announcement links are capped at 200 MB;
+  zip extraction is capped at 500 entries, 100 MB per file and 300 MB total
+  (defends against zip bombs / decompression DoS).
+- **`get` is not an open proxy.** It only accepts `*.must.edu.mo` URLs.
+- **LLM privacy.** `notes` sends extracted courseware text to the configured
+  DeepSeek-compatible API. If your course material is confidential, do not run
+  `notes` (or point `DEEPSEEK_API_BASE` at a local endpoint).
+- See [SECURITY.md](./SECURITY.md) for the threat model and how to report issues.
 
 ## Requirements
 
 - Node.js ≥ 18
-- Chromium (installed via `npx playwright install chromium`)
+- Chromium via `npx playwright install chromium`
+- Python 3.9+ (only for `notes`)
 
----
+## How it works
 
-## 🤖 For AI Agents
+- Playwright drives a headless Chromium through the M.U.S.T. CAS login.
+- Moodle pages are read through the authenticated browser context; the CLI does
+  not reimplement Moodle's web service API.
+- The timetable SPA signs its own requests, so must-bee hooks `XMLHttpRequest`
+  and reads the responses the page already receives instead of reverse
+  engineering the signature.
+- Everything is emitted as JSON: one value on stdout, errors as
+  `{"error": "...", "partialReport"?: {...}}` on stderr with a non-zero exit.
 
-> If you are an AI agent reading this README to install or invoke this skill, follow the steps below verbatim.
+Per-command output shapes are documented in [SKILL.md](./SKILL.md#output-shapes).
 
-**Skill purpose:** Sync M.U.S.T. Moodle coursework and query timetable. Invoke when the user asks about courses, schedule, assignments, or downloaded materials at M.U.S.T.
+## Credits
 
-### Install (idempotent)
+must-bee is a fork of [Cosmostima/muster_skill](https://github.com/Cosmostima/muster_skill)
+(MIT). Original copyright © 2026 Cosmostima. This fork adds timetable capture,
+announcement/forum scanning, external courseware download, assignment/post
+inspection, Obsidian note generation, and extensive hardening.
 
-```bash
-# 1. Place this folder under the host skills dir
-#    Claude Code:  ~/.claude/skills/muster
-#    OpenClaw:     <workspace>/skills/muster
-cd <path-to>/muster
+## License
 
-# 2. Install deps
-npm install
-npx playwright install chromium
-
-# 3. Required env (ASK THE USER — do not invent credentials)
-export MUSTER_USERNAME='<from-user>'
-export MUSTER_PASSWORD='<from-user>'
-```
-
-### Verify
-
-```bash
-node scripts/muster_cli.js status     # should print JSON
-node scripts/muster_test.js           # 55 unit tests, no network
-```
-
-### Invocation matrix
-
-| User intent | Command |
-|---|---|
-| "同步课程" / "sync courses" | `sync` (add `--week` or `--all` as needed) |
-| "今天 / 本周有什么课" | `schedule` (add `--week` for the full week) |
-| "我有哪些课" / "list my courses" | `courses` |
-| "CS101 这门课最近上传了什么" | `course --code CS101` |
-| "最近有什么作业要交" | `pending` |
-| "下周一上 CS101 之前要看什么材料" | `files --course CS101 --date <that-date>` |
-
-### Output contract
-
-- Every command writes one JSON object/array to stdout
-- Errors go to stderr as `{"error": "...", "partialReport"?: ...}` and exit non-zero (`partialReport` is only present when partial results are available)
-- Never parse human-readable output — only JSON
-- Per-command return shapes are documented in `SKILL.md` under "Output shapes"
+[MIT](./LICENSE)

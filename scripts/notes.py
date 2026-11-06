@@ -1,35 +1,82 @@
 #!/usr/bin/env python3
-"""must-bee notes — 课件 → Obsidian 复习笔记生成器
+"""must-bee notes — generate Obsidian review notes from courseware.
 
-用法:
-  python3 notes.py                          # 为所有课程的未笔记课件生成笔记
-  python3 notes.py --course CS440           # 只处理指定课程
-  python3 notes.py --force                  # 已存在的笔记也重新生成
-  python3 notes.py --dry-run                # 只列出将处理的课件，不调用 LLM
-  python3 notes.py --limit 1                # 最多处理 N 份课件
+Usage:
+  python3 notes.py                          # every courseware file without a note
+  python3 notes.py --course CS440           # only that course
+  python3 notes.py --force                  # regenerate existing notes
+  python3 notes.py --dry-run                # list tasks, no LLM calls
+  python3 notes.py --limit 1                # process at most N files
 
-输出: JSON 到 stdout（每份课件一个对象）。LLM 调用失败会进入 errors。
-依赖: PyMuPDF (fitz), python-pptx, requests。DEEPSEEK_API_KEY 从
-~/.hermes/.env 或 must-bee/.env 读取。vault 路径优先 OBSIDIAN_VAULT_PATH
-环境变量，否则 ~/Vaults/Obsidian。
+Output: JSON on stdout. Per-file failures go into `errors`; the process exits
+non-zero only when every task failed.
+
+Requirements: PyMuPDF (fitz), python-pptx, requests.
+Credentials: DEEPSEEK_API_KEY (environment, repo .env, or ~/.hermes/.env).
+Privacy: the extracted text of each courseware file is sent to the configured
+DeepSeek-compatible API. Do not run this on material you cannot share.
 """
 import argparse
 import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
-DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
-MODEL = "deepseek-chat"
-MAX_SOURCE_CHARS = 30000  # 每份课件喂给 LLM 的最大字符数
+DEFAULT_API_BASE = "https://api.deepseek.com"
+DEFAULT_MODEL = "deepseek-chat"
+MAX_SOURCE_CHARS = 30000  # max characters of courseware fed to the LLM per file
+MAX_FILES_PER_RUN = 500
 
-VAULT_DEFAULT = Path.home() / "Vaults/Obsidian"
+# Only these keys are imported from .env files. A shared ~/.hermes/.env can
+# contain unrelated secrets; the notes child process has no reason to see them.
+ALLOWED_ENV_KEYS = {
+    "DEEPSEEK_API_KEY",
+    "DEEPSEEK_API_BASE",
+    "DEEPSEEK_MODEL",
+    "OBSIDIAN_VAULT_PATH",
+    "MUSTER_DOWNLOAD_PATH",
+    "MUST_BEE_ENV",
+}
+
+COURSE_CODE_RE = re.compile(r"^(\d{4})-([A-Z]{2,4}\d{3})(?![0-9])", re.IGNORECASE)
+COURSE_CODE_FALLBACK_RE = re.compile(r"(?:^|[^A-Z0-9])([A-Z]{2,4}\d{3})(?![0-9])")
+
+
+def derive_course_code(course_name: str) -> str:
+    """Recover CS482 from names like 2609-CS482EX1-5A7EE7."""
+    text = str(course_name or "").strip()
+    match = COURSE_CODE_RE.match(text)
+    if match:
+        return match.group(2).upper()
+    match = COURSE_CODE_FALLBACK_RE.search(text.upper())
+    return match.group(1) if match else ""
+
+
+def repo_root() -> Path:
+    return Path(__file__).resolve().parent.parent
 
 
 def get_wemust_root() -> Path:
-    base = os.environ.get("MUSTER_DOWNLOAD_PATH", str(Path.home() / "Documents/wemust"))
-    return Path(base) / "wemust"
+    base = os.environ.get("MUSTER_DOWNLOAD_PATH", str(Path.home() / ".must-bee"))
+    root = Path(base).expanduser() / "wemust"
+
+    def has_course_state(directory: Path) -> bool:
+        try:
+            return directory.is_dir() and any(
+                (child / ".muster.json").is_file()
+                for child in directory.iterdir() if child.is_dir()
+            )
+        except OSError:
+            return False
+
+    # Compatibility with the old ~/.must-bee/wemust/wemust default.
+    nested = root / "wemust"
+    if not has_course_state(root) and has_course_state(nested):
+        return nested
+    return root
+
 
 SYSTEM_PROMPT = """你是课程助教，负责把讲义课件转成学生复习用的 Obsidian 笔记。用中文写，专业术语保留英文原文。
 
@@ -63,26 +110,76 @@ SYSTEM_PROMPT = """你是课程助教，负责把讲义课件转成学生复习�
 """
 
 
+def _parse_env_line(line: str):
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return None
+    if line.startswith("export "):
+        line = line[len("export "):].lstrip()
+    if "=" not in line:
+        return None
+    key, _, value = line.partition("=")
+    key = key.strip()
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+        return None
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1]
+    else:
+        value = re.sub(r"\s+#.*$", "", value)
+    return key, value
+
+
 def load_env():
-    """从 ~/.hermes/.env 和 ~/projects/must-bee/.env 读取环境变量（不覆盖已存在的）。"""
-    for env_path in [
-        Path.home() / ".hermes/.env",
-        Path.home() / "projects/must-bee/.env",
-    ]:
-        if not env_path.exists():
+    """Load KEY=VALUE pairs without overwriting the real environment.
+
+    Search order (first wins): $MUST_BEE_ENV, <repo>/.env,
+    ~/.config/must-bee/.env, ~/.must-bee/.env, ~/.hermes/.env (legacy).
+    """
+    candidates = []
+    override = os.environ.get("MUST_BEE_ENV")
+    if override:
+        candidates.append(Path(override).expanduser())
+    candidates.extend([
+        repo_root() / ".env",
+        Path.home() / ".config/must-bee/.env",
+        Path.home() / ".must-bee/.env",
+        Path.home() / ".hermes/.env",  # backward compatibility with Hermes setups
+    ])
+    for env_path in candidates:
+        if not env_path.is_file():
             continue
         try:
             for line in env_path.read_text().splitlines():
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
+                parsed = _parse_env_line(line)
+                if not parsed:
                     continue
-                key, _, value = line.partition("=")
-                key = key.strip()
-                value = value.strip().strip('"').strip("'")
-                if key and key not in os.environ:
+                key, value = parsed
+                if key in ALLOWED_ENV_KEYS and key not in os.environ:
                     os.environ[key] = value
         except OSError:
             pass
+
+
+def resolve_vault() -> Path:
+    env_value = os.environ.get("OBSIDIAN_VAULT_PATH")
+    legacy_icloud = Path.home() / "Documents/Obsidian Vault"
+    main_vault = Path.home() / "Vaults/Obsidian"
+    # An old iCloud placeholder is still exported by some setups. Prefer the
+    # migrated main vault when both exist, even if the env var is stale.
+    if env_value and Path(env_value).expanduser() == legacy_icloud and main_vault.is_dir():
+        return main_vault
+
+    candidates = []
+    if env_value:
+        candidates.append(Path(env_value).expanduser())
+    candidates.extend([main_vault, Path.home() / "Obsidian"])
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+    if legacy_icloud.is_dir() and not env_value:
+        return legacy_icloud
+    return candidates[0]
 
 
 def extract_pdf(path: Path) -> str:
@@ -134,43 +231,59 @@ def call_deepseek(source_text: str, meta: dict) -> str:
     import requests
     key = os.environ.get("DEEPSEEK_API_KEY")
     if not key:
-        raise RuntimeError("DEEPSEEK_API_KEY not found in env files")
+        raise RuntimeError("DEEPSEEK_API_KEY not found in environment or .env files")
+    base = os.environ.get("DEEPSEEK_API_BASE", DEFAULT_API_BASE).rstrip("/")
+    url = base if base.endswith("/chat/completions") else f"{base}/chat/completions"
+    model = os.environ.get("DEEPSEEK_MODEL", DEFAULT_MODEL)
     user = (
         f"课程: {meta['course']} ({meta['courseCode']})\n"
         f"课件: {meta['filename']}（{meta['date']}）\n\n"
         f"课件内容:\n{source_text}"
     )
-    resp = requests.post(
-        DEEPSEEK_URL,
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-        json={
-            "model": MODEL,
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user},
-            ],
-            "max_tokens": 4000,
-            "temperature": 0.3,
-        },
-        timeout=180,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    content = data["choices"][0]["message"]["content"]
-    return content.strip()
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user},
+        ],
+        "max_tokens": 4000,
+        "temperature": 0.3,
+    }
+    last_error = None
+    for attempt in range(3):
+        resp = requests.post(
+            url,
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=180,
+        )
+        if resp.status_code in (429, 500, 502, 503, 504) and attempt < 2:
+            last_error = f"HTTP {resp.status_code}"
+            time.sleep(2 ** attempt)
+            continue
+        resp.raise_for_status()
+        data = resp.json()
+        content = data["choices"][0]["message"]["content"]
+        return content.strip()
+    raise RuntimeError(f"DeepSeek API failed after retries: {last_error}")
+
+
+def yaml_string(value) -> str:
+    """JSON strings are valid YAML double-quoted scalars."""
+    return json.dumps(str(value), ensure_ascii=False)
 
 
 def note_frontmatter(meta: dict) -> str:
     title = f"{meta['date']} {Path(meta['filename']).stem}"
     return (
         "---\n"
-        f"title: \"{title}\"\n"
-        f"course: \"{meta['course']}\"\n"
-        f"courseCode: {meta['courseCode']}\n"
-        f"lectureDate: {meta['date']}\n"
-        f"source: \"{meta['fileUrl']}\"\n"
+        f"title: {yaml_string(title)}\n"
+        f"course: {yaml_string(meta['course'])}\n"
+        f"courseCode: {yaml_string(meta['courseCode'])}\n"
+        f"lectureDate: {yaml_string(meta['date'])}\n"
+        f"source: {yaml_string(meta['fileUrl'])}\n"
         "type: courseware-note\n"
-        "tags: [courseware, " + meta['courseCode'] + "]\n"
+        f"tags: [courseware, {yaml_string(meta['courseCode'])}]\n"
         "---\n\n"
     )
 
@@ -185,18 +298,31 @@ def load_course_state(course_dir: Path):
         return None
 
 
+def safe_name(name: str) -> str:
+    # Treat path separators as separators, not as characters to preserve:
+    # "../../2026-01-01" becomes "2026-01-01", never a traversal component.
+    parts = [p for p in re.split(r"[\\/]+", str(name)) if p not in ("", ".", "..")]
+    cleaned = re.sub(r'[:*?"<>|]+', "_", "_".join(parts)).strip().strip(".")
+    return cleaned or "course"
+
+
 def note_path_for(vault: Path, meta: dict) -> Path:
     course_folder = safe_name(f"{meta['course']} {meta['courseCode']}")
-    stem = Path(meta["filename"]).stem
-    return vault / "Courses" / course_folder / f"{meta['date']} {stem}.md"
+    stem = safe_name(Path(meta["filename"]).stem)
+    date = safe_name(meta.get("date") or "unknown")
+    return vault / "Courses" / course_folder / f"{date} {stem}.md"
 
 
-def safe_name(name: str) -> str:
-    return re.sub(r'[\\/:*?"<>|]+', "_", name).strip()
+def is_within(base: Path, target: Path) -> bool:
+    try:
+        target.resolve().relative_to(base.resolve())
+        return True
+    except ValueError:
+        return False
 
 
 def scan_tasks(vault: Path, course_filter=None, force=False):
-    """扫描 wemust 下载目录，找出需要生成笔记的课件。"""
+    """Scan the wemust download directory and return note-generation tasks."""
     tasks = []
     wemust_root = get_wemust_root()
     if not wemust_root.exists():
@@ -209,12 +335,16 @@ def scan_tasks(vault: Path, course_filter=None, force=False):
             continue
         code = state.get("courseCode") or ""
         name = state.get("courseName") or course_dir.name
+        if not code:
+            code = derive_course_code(name) or derive_course_code(course_dir.name)
         if course_filter and code.upper() != course_filter.upper():
             continue
         for f in state["files"]:
             if not f.get("path"):
                 continue
-            src = course_dir / f["path"]
+            src = (course_dir / f["path"]).resolve()
+            if not is_within(wemust_root, src):
+                continue  # never read outside the download root
             if not src.exists():
                 continue
             if src.suffix.lower() not in (".pdf", ".pptx"):
@@ -234,7 +364,7 @@ def scan_tasks(vault: Path, course_filter=None, force=False):
     return tasks
 
 
-def generate_note(meta: dict, force=False) -> dict:
+def generate_note(meta: dict) -> dict:
     src = Path(meta["srcPath"])
     text = extract_text(src)
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
@@ -246,26 +376,32 @@ def generate_note(meta: dict, force=False) -> dict:
     return {"body": body}
 
 
+def write_note_atomic(path: Path, content: str):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(content, encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def main():
-    parser = argparse.ArgumentParser(description="课件 → Obsidian 复习笔记")
-    parser.add_argument("--course", help="只处理指定课程代码")
-    parser.add_argument("--force", action="store_true", help="覆盖已存在的笔记")
-    parser.add_argument("--dry-run", action="store_true", help="只列出任务不生成")
-    parser.add_argument("--limit", type=int, default=0, help="最多生成 N 份")
+    parser = argparse.ArgumentParser(description="Courseware → Obsidian review notes")
+    parser.add_argument("--course", help="only this course code")
+    parser.add_argument("--force", action="store_true", help="overwrite existing notes")
+    parser.add_argument("--dry-run", action="store_true", help="list tasks without calling the LLM")
+    parser.add_argument("--limit", type=int, default=0, help="process at most N files")
     args = parser.parse_args()
 
     load_env()
-    vault = Path(os.environ.get("OBSIDIAN_VAULT_PATH", "")) if os.environ.get("OBSIDIAN_VAULT_PATH") else VAULT_DEFAULT
-    # 旧路径纠偏：.env 里的路径指向 iCloud 旧库时回退到主库
-    if not vault.exists() or vault == Path.home() / "Documents/Obsidian Vault":
-        vault = VAULT_DEFAULT
+    vault = resolve_vault()
     if not vault.exists():
-        print(json.dumps({"error": f"vault not found: {vault}"}))
+        print(json.dumps({
+            "error": f"Obsidian vault not found: {vault}. Set OBSIDIAN_VAULT_PATH."
+        }))
         sys.exit(1)
 
     tasks = scan_tasks(vault, args.course, args.force)
     if args.limit > 0:
-        tasks = tasks[: args.limit]
+        tasks = tasks[: min(args.limit, MAX_FILES_PER_RUN)]
 
     if args.dry_run:
         print(json.dumps({
@@ -279,15 +415,17 @@ def main():
     errors = []
     for t in tasks:
         meta = t["meta"]
+        note_path = Path(t["notePath"])
+        if not is_within(vault / "Courses", note_path):
+            errors.append({**meta, "error": "refusing to write outside the vault's Courses directory"})
+            continue
         try:
             gen = generate_note(meta)
             if "error" in gen:
                 errors.append({**meta, "error": gen["error"]})
                 continue
-            note_path = Path(t["notePath"])
-            note_path.parent.mkdir(parents=True, exist_ok=True)
             content = note_frontmatter(meta) + gen["body"] + "\n"
-            note_path.write_text(content)
+            write_note_atomic(note_path, content)
             results.append({
                 "course": meta["course"],
                 "courseCode": meta["courseCode"],

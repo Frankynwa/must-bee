@@ -1,30 +1,66 @@
 {
   "name": "must-bee",
-  "version": "2.0.0",
-  "private": true,
-  "description": "MUST Moodle + timetable sync skill — courseware and schedule",
+  "version": "2.1.0",
+  "description": "M.U.S.T. Moodle + timetable CLI — courseware, assignments and schedule as JSON for agents",
   "license": "MIT",
-  "author": "Cosmostima",
-  "homepage": "https://github.com/Cosmostima/muster_skill#readme",
-  "bugs": "https://github.com/Cosmostima/muster_skill/issues",
+  "author": "Frankynwa",
+  "contributors": [
+    "Cosmostima (original muster_skill)"
+  ],
+  "homepage": "https://github.com/Frankynwa/must-bee#readme",
+  "bugs": "https://github.com/Frankynwa/must-bee/issues",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Cosmostima/muster_skill.git"
+    "url": "https://github.com/Frankynwa/must-bee.git"
+  },
+  "bin": {
+    "must-bee": "scripts/muster_cli.js"
   },
   "main": "scripts/muster_cli.js",
   "type": "commonjs",
+  "files": [
+    "scripts/",
+    "README.md",
+    "README_CN.md",
+    "SKILL.md",
+    "LICENSE",
+    ".env.example"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "must",
+    "moodle",
+    "timetable",
+    "courseware",
+    "playwright",
+    "cli",
+    "agent",
+    "skill"
+  ],
   "scripts": {
     "sync": "node scripts/muster_cli.js sync",
     "schedule": "node scripts/muster_cli.js schedule",
     "courses": "node scripts/muster_cli.js courses",
     "course": "node scripts/muster_cli.js course",
+    "assign": "node scripts/muster_cli.js assign",
+    "post": "node scripts/muster_cli.js post",
+    "forum": "node scripts/muster_cli.js forum",
+    "links": "node scripts/muster_cli.js links",
     "pending": "node scripts/muster_cli.js pending",
     "files": "node scripts/muster_cli.js files",
+    "get": "node scripts/muster_cli.js get",
+    "notes": "node scripts/muster_cli.js notes",
     "status": "node scripts/muster_cli.js status",
-    "test": "node scripts/muster_test.js"
+    "check": "node --check scripts/muster_cli.js && node --check scripts/lib/core.js && node --check scripts/lib/net.js && node --check scripts/muster_test.js && python3 -m py_compile scripts/notes.py",
+    "test": "node scripts/muster_test.js",
+    "test:notes": "python3 scripts/test_notes.py",
+    "test:all": "npm test && npm run test:notes",
+    "prepublishOnly": "npm run check && npm run test:all"
   },
   "dependencies": {
-    "adm-zip": "^0.6.0",
+    "adm-zip": "^0.6.1",
     "playwright": "^1.52.0"
   }
 }
